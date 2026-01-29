@@ -544,8 +544,14 @@ func (d *Discoverer) parseStorageText(output string) ([]StorageInfo, error) {
 	return storage, nil
 }
 
+// validStorageName checks if a storage name contains only safe characters.
+var validStorageName = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
+
 // getStorageContent gets content types for a storage from config
 func (d *Discoverer) getStorageContent(storageName string) []string {
+	if !validStorageName.MatchString(storageName) {
+		return []string{"images"}
+	}
 	result, err := d.client.Run(fmt.Sprintf("grep -A 10 '^%s:' /etc/pve/storage.cfg 2>/dev/null | grep 'content' | head -1", storageName))
 	if err != nil || result.ExitCode != 0 {
 		return []string{"images", "rootdir"} // Default assumption
@@ -854,7 +860,7 @@ func parseJSON(data string, v interface{}) error {
 // DetectSubnetsFromBridge attempts to detect subnet info from a bridge
 func (d *Discoverer) DetectSubnetsFromBridge(bridge string) (cidr string, gateway string) {
 	// Try to get IP info from the bridge
-	result, err := d.client.Run(fmt.Sprintf("ip -j addr show %s 2>/dev/null", bridge))
+	result, err := d.client.Run("ip -j addr show " + ssh.ShellEscape(bridge) + " 2>/dev/null")
 	if err != nil || result.ExitCode != 0 {
 		return "", ""
 	}

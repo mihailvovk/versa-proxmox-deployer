@@ -7,10 +7,12 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -21,6 +23,9 @@ import (
 	"github.com/mihailvovk/versa-proxmox-deployer/sources"
 	"github.com/mihailvovk/versa-proxmox-deployer/ssh"
 )
+
+// validBridgeName matches safe Proxmox bridge names like vmbr0, vmbr1, etc.
+var validBridgeName = regexp.MustCompile(`^vmbr[0-9]+$`)
 
 //go:embed static/*
 var staticFiles embed.FS
@@ -99,6 +104,9 @@ func (s *Server) Start(httpPort int) error {
 	// Scan image sources on startup so images are ready before user connects
 	go s.scanAndUpdateImages()
 
+	// Start console session reaper for idle timeout cleanup
+	s.startSessionReaper()
+
 	cert, err := LoadOrGenerateCert(config.ConfigDir())
 	if err != nil {
 		return fmt.Errorf("failed to load/generate certificate: %w", err)
@@ -117,9 +125,14 @@ func (s *Server) Start(httpPort int) error {
 	mux.HandleFunc("/api/scan-sources", s.handleScanSources)
 	mux.HandleFunc("/api/sources", s.handleSources)
 	mux.HandleFunc("/api/upload-key", s.handleUploadKey)
+	mux.HandleFunc("/api/connection/status", s.handleConnectionStatus)
 	mux.HandleFunc("/api/deployments", s.handleDeployments)
 	mux.HandleFunc("/api/deployments/stop", s.handleDeploymentsStop)
 	mux.HandleFunc("/api/deployments/delete", s.handleDeploymentsDelete)
+
+	// Console routes
+	mux.HandleFunc("/api/console/serial", s.handleConsoleSerial)
+	mux.HandleFunc("/api/console/sessions", s.handleConsoleSessions)
 
 	// Static files
 	staticFS, err := fs.Sub(staticFiles, "static")
@@ -155,7 +168,7 @@ func (s *Server) Start(httpPort int) error {
 			Handler: mux,
 		}
 		if err := httpServer.ListenAndServe(); err != nil {
-			fmt.Printf("HTTP server error: %v\n", err)
+			slog.Error("http server failed", "error", err)
 		}
 	}()
 
@@ -184,15 +197,14 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 
 	switch r.Method {
 	case "GET":
-		resp := map[string]interface{}{
-			"lastProxmoxHost": s.cfg.LastProxmoxHost,
-			"lastProxmoxUser": s.cfg.LastProxmoxUser,
-			"lastStorage":     s.cfg.LastStorage,
-			"lastSSHKeyPath":  s.cfg.LastSSHKeyPath,
-			"imageSources":    s.cfg.ImageSources,
-			"hasPassword":     s.cfg.LastProxmoxPassword != "",
-		}
-		json.NewEncoder(w).Encode(resp)
+		json.NewEncoder(w).Encode(ConfigResponse{
+			LastProxmoxHost: s.cfg.LastProxmoxHost,
+			LastProxmoxUser: s.cfg.LastProxmoxUser,
+			LastStorage:     s.cfg.LastStorage,
+			LastSSHKeyPath:  s.cfg.LastSSHKeyPath,
+			ImageSources:    s.cfg.ImageSources,
+			HasPassword:     s.cfg.LastProxmoxPassword != "",
+		})
 
 	case "POST":
 		var updates map[string]interface{}
@@ -219,11 +231,30 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-		json.NewEncoder(w).Encode(map[string]bool{"success": true})
+		json.NewEncoder(w).Encode(APIResponse{Success: true})
 
 	default:
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 	}
+}
+
+func (s *Server) handleConnectionStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "GET" {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	connected := s.sshClient != nil && s.sshClient.IsConnected()
+	host := ""
+	if s.sshClient != nil {
+		host = s.sshClient.Host()
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(ConnectionStatusResponse{
+		Connected: connected,
+		Host:      host,
+	})
 }
 
 func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
@@ -250,9 +281,10 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 
 	// Build SSH client options
 	opts := ssh.ClientOptions{
-		Host:    req.Host,
-		User:    req.User,
-		Timeout: 30 * time.Second,
+		Host:         req.Host,
+		User:         req.User,
+		Timeout:      30 * time.Second,
+		HostKeyCheck: true,
 	}
 	if req.SSHKeyPath != "" {
 		opts.KeyPath = req.SSHKeyPath
@@ -269,18 +301,18 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 	client, err := ssh.NewClient(opts)
 	if err != nil {
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"success": false,
-			"error":   fmt.Sprintf("SSH client creation failed: %v", err),
+		json.NewEncoder(w).Encode(APIResponse{
+			Success: false,
+			Error:   fmt.Sprintf("SSH client creation failed: %v", err),
 		})
 		return
 	}
 
 	if err := client.Connect(); err != nil {
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"success": false,
-			"error":   fmt.Sprintf("SSH connection failed: %v", err),
+		json.NewEncoder(w).Encode(APIResponse{
+			Success: false,
+			Error:   fmt.Sprintf("SSH connection failed: %v", err),
 		})
 		return
 	}
@@ -308,9 +340,7 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 	go s.runParallelDiscovery()
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"success": true,
-	})
+	json.NewEncoder(w).Encode(APIResponse{Success: true})
 }
 
 func (s *Server) runParallelDiscovery() {
@@ -395,11 +425,17 @@ func (s *Server) ensureBridgesExist(networks config.NetworkConfig) error {
 		networks.RouterHABridge,
 	} {
 		if b != "" {
+			if !validBridgeName.MatchString(b) {
+				return fmt.Errorf("invalid bridge name %q: must match vmbr[0-9]+", b)
+			}
 			bridges[b] = true
 		}
 	}
 	for _, b := range networks.ControllerWANBridges {
 		if b != "" {
+			if !validBridgeName.MatchString(b) {
+				return fmt.Errorf("invalid bridge name %q: must match vmbr[0-9]+", b)
+			}
 			bridges[b] = true
 		}
 	}
@@ -439,17 +475,17 @@ func (s *Server) ensureBridgesExist(networks config.NetworkConfig) error {
 		return nil
 	}
 
-	fmt.Printf("Need to create bridges: %v\n", missing)
+	slog.Info("creating bridges", "bridges", missing)
 
 	// Append missing bridges to /etc/network/interfaces
 	for _, bridge := range missing {
 		if defined[bridge] {
 			// Already in config but not active — just needs ifup
-			fmt.Printf("Bridge %s is defined but not active, will ifup\n", bridge)
+			slog.Info("bridge defined but not active, will ifup", "bridge", bridge)
 			continue
 		}
 
-		fmt.Printf("Adding bridge %s to /etc/network/interfaces\n", bridge)
+		slog.Info("adding bridge to interfaces", "bridge", bridge)
 
 		// Append bridge config block
 		appendCmd := fmt.Sprintf(
@@ -467,14 +503,14 @@ func (s *Server) ensureBridgesExist(networks config.NetworkConfig) error {
 
 	// Bring up each missing bridge
 	for _, bridge := range missing {
-		fmt.Printf("Bringing up bridge %s\n", bridge)
+		slog.Info("bringing up bridge", "bridge", bridge)
 		r, err := s.sshClient.Run(fmt.Sprintf("ifup %s", bridge))
 		if err != nil {
 			return fmt.Errorf("ifup %s: %w", bridge, err)
 		}
 		if r.ExitCode != 0 {
 			// Try ifreload as fallback
-			fmt.Printf("ifup %s failed, trying ifreload -a\n", bridge)
+			slog.Warn("ifup failed, trying ifreload", "bridge", bridge)
 			r2, _ := s.sshClient.Run("ifreload -a")
 			if r2 != nil && r2.ExitCode != 0 {
 				return fmt.Errorf("bringing up bridge %s failed — ifup exit %d: %s, ifreload exit %d: %s",
@@ -496,10 +532,10 @@ func (s *Server) ensureBridgesExist(networks config.NetworkConfig) error {
 		if !nowExisting[bridge] {
 			return fmt.Errorf("bridge %s was configured but is not active after ifup — check /etc/network/interfaces on Proxmox host", bridge)
 		}
-		fmt.Printf("Verified bridge %s is active\n", bridge)
+		slog.Info("bridge verified active", "bridge", bridge)
 	}
 
-	fmt.Printf("Successfully created and verified bridges: %v\n", missing)
+	slog.Info("bridges created and verified", "bridges", missing)
 	return nil
 }
 
@@ -519,29 +555,20 @@ func (s *Server) handleDeploy(w http.ResponseWriter, r *http.Request) {
 
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"success": false,
-			"error":   fmt.Sprintf("Invalid request: %v", err),
-		})
+		json.NewEncoder(w).Encode(APIResponse{Error: fmt.Sprintf("Invalid request: %v", err)})
 		return
 	}
 
 	if s.sshClient == nil {
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"success": false,
-			"error":   "Not connected to Proxmox",
-		})
+		json.NewEncoder(w).Encode(APIResponse{Error: "Not connected to Proxmox"})
 		return
 	}
 
 	// Auto-create any bridges that don't exist on Proxmox
 	if err := s.ensureBridgesExist(req.Networks); err != nil {
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"success": false,
-			"error":   fmt.Sprintf("Failed to create bridges: %v", err),
-		})
+		json.NewEncoder(w).Encode(APIResponse{Error: fmt.Sprintf("Failed to create bridges: %v", err)})
 		return
 	}
 
@@ -577,9 +604,9 @@ func (s *Server) handleDeploy(w http.ResponseWriter, r *http.Request) {
 	logPath := filepath.Join(logDir, fmt.Sprintf("deploy-%s.log", time.Now().Format("2006-01-02_15-04-05")))
 	logFile, logErr := os.Create(logPath)
 	if logErr != nil {
-		fmt.Printf("Warning: could not create deploy log file: %v\n", logErr)
+		slog.Warn("could not create deploy log file", "error", logErr)
 	} else {
-		fmt.Printf("Deploy log: %s\n", logPath)
+		slog.Info("deploy log created", "path", logPath)
 	}
 
 	writeLog := func(msg string) {
@@ -624,10 +651,7 @@ func (s *Server) handleDeploy(w http.ResponseWriter, r *http.Request) {
 		s.deployMu.Unlock()
 
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"success": false,
-			"error":   fmt.Sprintf("Discovery failed: %v", err),
-		})
+		json.NewEncoder(w).Encode(APIResponse{Error: fmt.Sprintf("Discovery failed: %v", err)})
 		return
 	}
 
@@ -670,9 +694,9 @@ func (s *Server) handleDeploy(w http.ResponseWriter, r *http.Request) {
 	}()
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"success": true,
-		"message": "Deployment started",
+	json.NewEncoder(w).Encode(DeployStartResponse{
+		APIResponse: APIResponse{Success: true},
+		Message:     "Deployment started",
 	})
 }
 
@@ -743,7 +767,7 @@ func (s *Server) handleDeployStatus(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	if status == nil {
-		json.NewEncoder(w).Encode(map[string]interface{}{"active": false})
+		json.NewEncoder(w).Encode(&DeployStatus{Active: false})
 		return
 	}
 	json.NewEncoder(w).Encode(status)
@@ -772,25 +796,22 @@ func (s *Server) handleCreateNetwork(w http.ResponseWriter, r *http.Request) {
 
 	if s.sshClient == nil {
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"success": false,
-			"error":   "Not connected to Proxmox",
-		})
+		json.NewEncoder(w).Encode(APIResponse{Error: "Not connected to Proxmox"})
 		return
 	}
 
-	cmd := fmt.Sprintf("pvesh create /nodes/%s/network -iface %s -type bridge", req.Node, req.Name)
+	cmd := "pvesh create /nodes/" + ssh.ShellEscape(req.Node) + "/network -iface " + ssh.ShellEscape(req.Name) + " -type bridge"
 	if req.VLANAware {
 		cmd += " -bridge_vlan_aware 1"
 	}
 	if req.Interface != "" {
-		cmd += fmt.Sprintf(" -bridge_ports %s", req.Interface)
+		cmd += " -bridge_ports " + ssh.ShellEscape(req.Interface)
 	}
 	if req.Address != "" {
-		cmd += fmt.Sprintf(" -address %s", req.Address)
+		cmd += " -address " + ssh.ShellEscape(req.Address)
 	}
 	if req.Gateway != "" {
-		cmd += fmt.Sprintf(" -gateway %s", req.Gateway)
+		cmd += " -gateway " + ssh.ShellEscape(req.Gateway)
 	}
 
 	result, err := s.sshClient.Run(cmd)
@@ -803,22 +824,17 @@ func (s *Server) handleCreateNetwork(w http.ResponseWriter, r *http.Request) {
 			errMsg += ": " + result.Stderr
 		}
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"success": false,
-			"error":   errMsg,
-		})
+		json.NewEncoder(w).Encode(APIResponse{Error: errMsg})
 		return
 	}
 
 	// Apply network changes
-	s.sshClient.Run(fmt.Sprintf("pvesh set /nodes/%s/network", req.Node))
+	s.sshClient.Run("pvesh set /nodes/" + ssh.ShellEscape(req.Node) + "/network")
 
 	go s.runParallelDiscovery()
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"success": true,
-	})
+	json.NewEncoder(w).Encode(APIResponse{Success: true})
 }
 
 func (s *Server) handleScanSources(w http.ResponseWriter, r *http.Request) {
@@ -830,20 +846,14 @@ func (s *Server) handleScanSources(w http.ResponseWriter, r *http.Request) {
 	imageSources, err := sources.CreateSourcesFromConfig(s.cfg)
 	if err != nil {
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"success": false,
-			"error":   err.Error(),
-		})
+		json.NewEncoder(w).Encode(ScanSourcesResponse{APIResponse: APIResponse{Error: err.Error()}})
 		return
 	}
 
 	collection, err := sources.ScanAllSources(imageSources)
 	if err != nil {
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"success": false,
-			"error":   err.Error(),
-		})
+		json.NewEncoder(w).Encode(ScanSourcesResponse{APIResponse: APIResponse{Error: err.Error()}})
 		return
 	}
 
@@ -860,10 +870,10 @@ func (s *Server) handleScanSources(w http.ResponseWriter, r *http.Request) {
 	s.mu.Unlock()
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"success": true,
-		"images":  allImages,
-		"sources": collection.Sources,
+	json.NewEncoder(w).Encode(ScanSourcesResponse{
+		APIResponse: APIResponse{Success: true},
+		Images:      allImages,
+		Sources:     collection.Sources,
 	})
 }
 
@@ -873,9 +883,9 @@ func (s *Server) handleSources(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case "GET":
 		// Return configured sources
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"success": true,
-			"sources": s.cfg.ImageSources,
+		json.NewEncoder(w).Encode(SourcesResponse{
+			APIResponse: APIResponse{Success: true},
+			Sources:     s.cfg.ImageSources,
 		})
 
 	case "POST":
@@ -888,18 +898,12 @@ func (s *Server) handleSources(w http.ResponseWriter, r *http.Request) {
 			Password string `json:"password"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			json.NewEncoder(w).Encode(map[string]interface{}{
-				"success": false,
-				"error":   err.Error(),
-			})
+			json.NewEncoder(w).Encode(SourcesResponse{APIResponse: APIResponse{Error: err.Error()}})
 			return
 		}
 
 		if req.URL == "" {
-			json.NewEncoder(w).Encode(map[string]interface{}{
-				"success": false,
-				"error":   "URL is required",
-			})
+			json.NewEncoder(w).Encode(SourcesResponse{APIResponse: APIResponse{Error: "URL is required"}})
 			return
 		}
 
@@ -927,26 +931,17 @@ func (s *Server) handleSources(w http.ResponseWriter, r *http.Request) {
 		// Validate by testing connection
 		src, err := sources.CreateSource(newSource)
 		if err != nil {
-			json.NewEncoder(w).Encode(map[string]interface{}{
-				"success": false,
-				"error":   fmt.Sprintf("Invalid source: %v", err),
-			})
+			json.NewEncoder(w).Encode(SourcesResponse{APIResponse: APIResponse{Error: fmt.Sprintf("Invalid source: %v", err)}})
 			return
 		}
 
 		if err := sources.TestSourceConnection(src); err != nil {
-			json.NewEncoder(w).Encode(map[string]interface{}{
-				"success": false,
-				"error":   fmt.Sprintf("Connection test failed: %v", err),
-			})
+			json.NewEncoder(w).Encode(SourcesResponse{APIResponse: APIResponse{Error: fmt.Sprintf("Connection test failed: %v", err)}})
 			return
 		}
 
 		if err := s.cfg.AddImageSource(newSource); err != nil {
-			json.NewEncoder(w).Encode(map[string]interface{}{
-				"success": false,
-				"error":   err.Error(),
-			})
+			json.NewEncoder(w).Encode(SourcesResponse{APIResponse: APIResponse{Error: err.Error()}})
 			return
 		}
 
@@ -955,9 +950,9 @@ func (s *Server) handleSources(w http.ResponseWriter, r *http.Request) {
 		// Trigger a rescan in background
 		go s.scanAndUpdateImages()
 
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"success": true,
-			"sources": s.cfg.ImageSources,
+		json.NewEncoder(w).Encode(SourcesResponse{
+			APIResponse: APIResponse{Success: true},
+			Sources:     s.cfg.ImageSources,
 		})
 
 	case "DELETE":
@@ -966,10 +961,7 @@ func (s *Server) handleSources(w http.ResponseWriter, r *http.Request) {
 			URL string `json:"url"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			json.NewEncoder(w).Encode(map[string]interface{}{
-				"success": false,
-				"error":   err.Error(),
-			})
+			json.NewEncoder(w).Encode(SourcesResponse{APIResponse: APIResponse{Error: err.Error()}})
 			return
 		}
 
@@ -979,9 +971,9 @@ func (s *Server) handleSources(w http.ResponseWriter, r *http.Request) {
 		// Trigger a rescan in background
 		go s.scanAndUpdateImages()
 
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"success": true,
-			"sources": s.cfg.ImageSources,
+		json.NewEncoder(w).Encode(SourcesResponse{
+			APIResponse: APIResponse{Success: true},
+			Sources:     s.cfg.ImageSources,
 		})
 
 	default:
@@ -1027,20 +1019,14 @@ func (s *Server) handleUploadKey(w http.ResponseWriter, r *http.Request) {
 
 	file, header, err := r.FormFile("key")
 	if err != nil {
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"success": false,
-			"error":   fmt.Sprintf("Failed to read uploaded file: %v", err),
-		})
+		json.NewEncoder(w).Encode(UploadKeyResponse{APIResponse: APIResponse{Error: fmt.Sprintf("Failed to read uploaded file: %v", err)}})
 		return
 	}
 	defer file.Close()
 
 	keyData, err := io.ReadAll(file)
 	if err != nil {
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"success": false,
-			"error":   fmt.Sprintf("Failed to read key data: %v", err),
-		})
+		json.NewEncoder(w).Encode(UploadKeyResponse{APIResponse: APIResponse{Error: fmt.Sprintf("Failed to read key data: %v", err)}})
 		return
 	}
 
@@ -1053,10 +1039,7 @@ func (s *Server) handleUploadKey(w http.ResponseWriter, r *http.Request) {
 	keyPath := filepath.Join(keyDir, keyName)
 
 	if err := os.WriteFile(keyPath, keyData, 0600); err != nil {
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"success": false,
-			"error":   fmt.Sprintf("Failed to save key: %v", err),
-		})
+		json.NewEncoder(w).Encode(UploadKeyResponse{APIResponse: APIResponse{Error: fmt.Sprintf("Failed to save key: %v", err)}})
 		return
 	}
 
@@ -1064,10 +1047,10 @@ func (s *Server) handleUploadKey(w http.ResponseWriter, r *http.Request) {
 	s.cfg.LastSSHKeyPath = keyPath
 	s.cfg.Save()
 
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"success": true,
-		"keyPath": keyPath,
-		"keyName": keyName,
+	json.NewEncoder(w).Encode(UploadKeyResponse{
+		APIResponse: APIResponse{Success: true},
+		KeyPath:     keyPath,
+		KeyName:     keyName,
 	})
 }
 
@@ -1086,19 +1069,13 @@ func (s *Server) handleDeployments(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 
 	if s.sshClient == nil || s.discoverer == nil {
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"success": false,
-			"error":   "Not connected to Proxmox",
-		})
+		json.NewEncoder(w).Encode(DeploymentsResponse{APIResponse: APIResponse{Error: "Not connected to Proxmox"}})
 		return
 	}
 
 	versaVMs, err := s.discoverer.FindVersaDeployments()
 	if err != nil {
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"success": false,
-			"error":   fmt.Sprintf("Failed to find deployments: %v", err),
-		})
+		json.NewEncoder(w).Encode(DeploymentsResponse{APIResponse: APIResponse{Error: fmt.Sprintf("Failed to find deployments: %v", err)}})
 		return
 	}
 
@@ -1115,9 +1092,9 @@ func (s *Server) handleDeployments(w http.ResponseWriter, r *http.Request) {
 		groups[prefix].VMs = append(groups[prefix].VMs, vm)
 	}
 
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"success":     true,
-		"deployments": groups,
+	json.NewEncoder(w).Encode(DeploymentsResponse{
+		APIResponse: APIResponse{Success: true},
+		Deployments: groups,
 	})
 }
 
@@ -1160,28 +1137,19 @@ func (s *Server) handleDeploymentsStop(w http.ResponseWriter, r *http.Request) {
 		Prefix string `json:"prefix"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"success": false,
-			"error":   fmt.Sprintf("Invalid request: %v", err),
-		})
+		json.NewEncoder(w).Encode(VMActionResponse{APIResponse: APIResponse{Error: fmt.Sprintf("Invalid request: %v", err)}})
 		return
 	}
 
 	if s.sshClient == nil || s.discoverer == nil {
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"success": false,
-			"error":   "Not connected to Proxmox",
-		})
+		json.NewEncoder(w).Encode(VMActionResponse{APIResponse: APIResponse{Error: "Not connected to Proxmox"}})
 		return
 	}
 
 	// Safety: verify all VMIDs have the versa-deployer tag
 	versaVMs, err := s.discoverer.FindVersaDeployments()
 	if err != nil {
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"success": false,
-			"error":   fmt.Sprintf("Failed to verify VMs: %v", err),
-		})
+		json.NewEncoder(w).Encode(VMActionResponse{APIResponse: APIResponse{Error: fmt.Sprintf("Failed to verify VMs: %v", err)}})
 		return
 	}
 
@@ -1192,36 +1160,32 @@ func (s *Server) handleDeploymentsStop(w http.ResponseWriter, r *http.Request) {
 
 	for _, vmid := range req.VMIDs {
 		if _, ok := versaLookup[vmid]; !ok {
-			json.NewEncoder(w).Encode(map[string]interface{}{
-				"success": false,
-				"error":   fmt.Sprintf("VM %d does not have versa-deployer tag — refusing to stop", vmid),
-			})
+			json.NewEncoder(w).Encode(VMActionResponse{APIResponse: APIResponse{Error: fmt.Sprintf("VM %d does not have versa-deployer tag — refusing to stop", vmid)}})
 			return
 		}
 	}
 
 	vmCreator := proxmox.NewVMCreator(s.sshClient)
-	results := make([]map[string]interface{}, 0, len(req.VMIDs))
+	results := make([]VMActionResult, 0, len(req.VMIDs))
 
 	for _, vmid := range req.VMIDs {
 		vm := versaLookup[vmid]
-		entry := map[string]interface{}{
-			"vmid": vmid,
-			"name": vm.Name,
+		entry := VMActionResult{
+			VMID: vmid,
+			Name: vm.Name,
 		}
 
 		if err := vmCreator.StopVM(vmid); err != nil {
-			entry["success"] = false
-			entry["error"] = err.Error()
+			entry.Error = err.Error()
 		} else {
-			entry["success"] = true
+			entry.Success = true
 		}
 		results = append(results, entry)
 	}
 
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"success": true,
-		"results": results,
+	json.NewEncoder(w).Encode(VMActionResponse{
+		APIResponse: APIResponse{Success: true},
+		Results:     results,
 	})
 }
 
@@ -1238,36 +1202,24 @@ func (s *Server) handleDeploymentsDelete(w http.ResponseWriter, r *http.Request)
 		Prefix string `json:"prefix"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"success": false,
-			"error":   fmt.Sprintf("Invalid request: %v", err),
-		})
+		json.NewEncoder(w).Encode(VMActionResponse{APIResponse: APIResponse{Error: fmt.Sprintf("Invalid request: %v", err)}})
 		return
 	}
 
 	if s.sshClient == nil || s.discoverer == nil {
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"success": false,
-			"error":   "Not connected to Proxmox",
-		})
+		json.NewEncoder(w).Encode(VMActionResponse{APIResponse: APIResponse{Error: "Not connected to Proxmox"}})
 		return
 	}
 
 	if len(req.VMIDs) == 0 {
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"success": false,
-			"error":   "No VMIDs provided",
-		})
+		json.NewEncoder(w).Encode(VMActionResponse{APIResponse: APIResponse{Error: "No VMIDs provided"}})
 		return
 	}
 
 	// Safety: verify all VMIDs have the versa-deployer tag
 	versaVMs, err := s.discoverer.FindVersaDeployments()
 	if err != nil {
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"success": false,
-			"error":   fmt.Sprintf("Failed to verify VMs: %v", err),
-		})
+		json.NewEncoder(w).Encode(VMActionResponse{APIResponse: APIResponse{Error: fmt.Sprintf("Failed to verify VMs: %v", err)}})
 		return
 	}
 
@@ -1280,36 +1232,32 @@ func (s *Server) handleDeploymentsDelete(w http.ResponseWriter, r *http.Request)
 	// Validate every requested VMID has the versa-deployer tag
 	for _, vmid := range req.VMIDs {
 		if _, ok := versaLookup[vmid]; !ok {
-			json.NewEncoder(w).Encode(map[string]interface{}{
-				"success": false,
-				"error":   fmt.Sprintf("VM %d does not have versa-deployer tag — refusing to delete", vmid),
-			})
+			json.NewEncoder(w).Encode(VMActionResponse{APIResponse: APIResponse{Error: fmt.Sprintf("VM %d does not have versa-deployer tag — refusing to delete", vmid)}})
 			return
 		}
 	}
 
 	// All checks passed — stop and destroy each VM
 	vmCreator := proxmox.NewVMCreator(s.sshClient)
-	results := make([]map[string]interface{}, 0, len(req.VMIDs))
+	results := make([]VMActionResult, 0, len(req.VMIDs))
 
 	for _, vmid := range req.VMIDs {
 		vm := versaLookup[vmid]
-		entry := map[string]interface{}{
-			"vmid": vmid,
-			"name": vm.Name,
+		entry := VMActionResult{
+			VMID: vmid,
+			Name: vm.Name,
 		}
 
 		if err := vmCreator.DestroyVM(vmid); err != nil {
-			entry["success"] = false
-			entry["error"] = err.Error()
+			entry.Error = err.Error()
 		} else {
-			entry["success"] = true
+			entry.Success = true
 		}
 		results = append(results, entry)
 	}
 
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"success": true,
-		"results": results,
+	json.NewEncoder(w).Encode(VMActionResponse{
+		APIResponse: APIResponse{Success: true},
+		Results:     results,
 	})
 }

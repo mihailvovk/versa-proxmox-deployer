@@ -1,12 +1,16 @@
 package ssh
 
 import (
+	"errors"
 	"fmt"
 	"net"
+	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
 	"golang.org/x/crypto/ssh"
+	"golang.org/x/crypto/ssh/knownhosts"
 )
 
 // Client wraps an SSH connection with convenience methods
@@ -64,10 +68,14 @@ func NewClient(opts ClientOptions) (*Client, error) {
 		return nil, fmt.Errorf("no authentication method provided (need password or SSH key)")
 	}
 
-	// Host key callback
+	// Host key callback — TOFU (Trust On First Use)
 	var hostKeyCallback ssh.HostKeyCallback
 	if opts.HostKeyCheck {
-		hostKeyCallback = ssh.InsecureIgnoreHostKey() // TODO: implement proper host key checking
+		cb, err := tofuHostKeyCallback()
+		if err != nil {
+			return nil, fmt.Errorf("setting up host key verification: %w", err)
+		}
+		hostKeyCallback = cb
 	} else {
 		hostKeyCallback = ssh.InsecureIgnoreHostKey()
 	}
@@ -254,4 +262,78 @@ func (c *Client) newSession() (*ssh.Session, error) {
 	}
 
 	return session, nil
+}
+
+// knownHostsDir returns ~/.versa-deployer
+func knownHostsDir() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		home = "."
+	}
+	return filepath.Join(home, ".versa-deployer")
+}
+
+// knownHostsPath returns the path to the known_hosts file.
+func knownHostsPath() string {
+	return filepath.Join(knownHostsDir(), "known_hosts")
+}
+
+// tofuHostKeyCallback returns a TOFU (Trust On First Use) host key callback.
+// On first connection to a host, the key is accepted and written to the known_hosts file.
+// On subsequent connections, the key is verified against the stored key.
+// If the key has changed, an error is returned warning about a possible MITM attack.
+func tofuHostKeyCallback() (ssh.HostKeyCallback, error) {
+	khPath := knownHostsPath()
+
+	// Ensure directory and file exist
+	if err := os.MkdirAll(knownHostsDir(), 0700); err != nil {
+		return nil, fmt.Errorf("creating known_hosts directory: %w", err)
+	}
+
+	// Create the file if it doesn't exist
+	if _, err := os.Stat(khPath); os.IsNotExist(err) {
+		f, err := os.OpenFile(khPath, os.O_CREATE|os.O_WRONLY, 0600)
+		if err != nil {
+			return nil, fmt.Errorf("creating known_hosts file: %w", err)
+		}
+		f.Close()
+	}
+
+	// Try to load existing known hosts
+	existingCb, err := knownhosts.New(khPath)
+	if err != nil {
+		return nil, fmt.Errorf("loading known_hosts: %w", err)
+	}
+
+	// Wrap in TOFU logic
+	return func(hostname string, remote net.Addr, key ssh.PublicKey) error {
+		err := existingCb(hostname, remote, key)
+		if err == nil {
+			// Known host, key matches
+			return nil
+		}
+
+		// Check if this is a "key not found" error (unknown host) vs "key changed" (MITM)
+		var keyErr *knownhosts.KeyError
+		if errors.As(err, &keyErr) && len(keyErr.Want) == 0 {
+			// Unknown host — trust on first use, append to known_hosts
+			f, appendErr := os.OpenFile(khPath, os.O_APPEND|os.O_WRONLY, 0600)
+			if appendErr != nil {
+				return fmt.Errorf("failed to save host key: %w", appendErr)
+			}
+			defer f.Close()
+
+			line := knownhosts.Line([]string{knownhosts.Normalize(hostname)}, key)
+			if _, writeErr := fmt.Fprintln(f, line); writeErr != nil {
+				return fmt.Errorf("failed to write host key: %w", writeErr)
+			}
+
+			return nil
+		}
+
+		// Key has changed — possible MITM
+		return fmt.Errorf("WARNING: host key for %s has changed! This could indicate a MITM attack. "+
+			"If you trust this host, remove the old entry from %s and reconnect. Original error: %w",
+			hostname, khPath, err)
+	}, nil
 }

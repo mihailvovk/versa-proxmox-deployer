@@ -210,6 +210,11 @@ type NetworkConfig struct {
 	// Router HA synchronization network (only for HA mode)
 	RouterHABridge string
 	RouterHAVLAN   int
+
+	// Per-component interface ordering. Keys are component type names (e.g. "controller").
+	// Values are ordered lists of interface IDs (e.g. ["base:0", "base:1", "wan:0"]).
+	// When set, BuildNetworksForComponent uses this to reorder the network interfaces.
+	InterfaceOrder map[string][]string
 }
 
 // VLANPurpose represents the purpose/name of a VLAN configuration

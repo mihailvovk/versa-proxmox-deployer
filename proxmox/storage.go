@@ -34,7 +34,7 @@ type ISOInfo struct {
 // ListISOs lists ISO files in a storage
 func (s *StorageManager) ListISOs(storage string) ([]ISOInfo, error) {
 	// Get storage path
-	result, err := s.client.Run(fmt.Sprintf("pvesm path %s:iso/dummy.iso 2>/dev/null | sed 's|/dummy.iso||'", storage))
+	result, err := s.client.Run("pvesm path " + ssh.ShellEscape(storage+":iso/dummy.iso") + " 2>/dev/null | sed 's|/dummy.iso||'")
 	if err != nil {
 		return nil, err
 	}
@@ -46,7 +46,7 @@ func (s *StorageManager) ListISOs(storage string) ([]ISOInfo, error) {
 	}
 
 	// List ISOs
-	result, err = s.client.Run(fmt.Sprintf("ls -la %s/*.iso 2>/dev/null || true", basePath))
+	result, err = s.client.Run("find " + ssh.ShellEscape(basePath) + " -maxdepth 1 -name '*.iso' -exec ls -la {} + 2>/dev/null || true")
 	if err != nil {
 		return nil, err
 	}
@@ -77,7 +77,7 @@ func (s *StorageManager) ListISOs(storage string) ([]ISOInfo, error) {
 
 // ISOExists checks if an ISO exists in storage
 func (s *StorageManager) ISOExists(storage, filename string) (bool, error) {
-	result, err := s.client.Run(fmt.Sprintf("pvesm list %s --content iso 2>/dev/null | grep -q '%s'", storage, filename))
+	result, err := s.client.Run("pvesm list " + ssh.ShellEscape(storage) + " --content iso 2>/dev/null | grep -qF " + ssh.ShellEscape(filename))
 	if err != nil {
 		return false, nil // Command failed, ISO doesn't exist
 	}
@@ -86,7 +86,7 @@ func (s *StorageManager) ISOExists(storage, filename string) (bool, error) {
 
 // GetISOPath returns the full path to an ISO on Proxmox
 func (s *StorageManager) GetISOPath(storage, filename string) (string, error) {
-	result, err := s.client.Run(fmt.Sprintf("pvesm path %s:iso/%s", storage, filename))
+	result, err := s.client.Run("pvesm path " + ssh.ShellEscape(storage+":iso/"+filename))
 	if err != nil {
 		return "", err
 	}
@@ -102,7 +102,7 @@ func (s *StorageManager) GetISOPath(storage, filename string) (string, error) {
 // GetISOStoragePath returns the base path for ISO storage
 func (s *StorageManager) GetISOStoragePath(storage string) (string, error) {
 	// Get path to a dummy ISO to extract the base path
-	result, err := s.client.Run(fmt.Sprintf("pvesm path %s:iso/test.iso 2>/dev/null || echo '/var/lib/vz/template/iso/test.iso'", storage))
+	result, err := s.client.Run("pvesm path " + ssh.ShellEscape(storage+":iso/test.iso") + " 2>/dev/null || echo '/var/lib/vz/template/iso/test.iso'")
 	if err != nil {
 		return "/var/lib/vz/template/iso", nil
 	}
@@ -138,7 +138,7 @@ func (s *StorageManager) VerifyISOMD5(storage, filename, expectedMD5 string) (bo
 		return false, err
 	}
 
-	result, err := s.client.Run(fmt.Sprintf("md5sum %s", path))
+	result, err := s.client.Run("md5sum " + ssh.ShellEscape(path))
 	if err != nil {
 		return false, err
 	}
@@ -157,7 +157,7 @@ func (s *StorageManager) VerifyISOMD5(storage, filename, expectedMD5 string) (bo
 
 // GetRemoteMD5 calculates MD5 of a file on Proxmox
 func (s *StorageManager) GetRemoteMD5(remotePath string) (string, error) {
-	result, err := s.client.Run(fmt.Sprintf("md5sum %s", remotePath))
+	result, err := s.client.Run("md5sum " + ssh.ShellEscape(remotePath))
 	if err != nil {
 		return "", err
 	}
@@ -227,7 +227,7 @@ func (s *StorageManager) DeleteISO(storage, filename string) error {
 		return err
 	}
 
-	return s.client.RunQuiet(fmt.Sprintf("rm -f %s", path))
+	return s.client.RunQuiet("rm -f " + ssh.ShellEscape(path))
 }
 
 // GetStorageInfo returns detailed info about a storage
@@ -284,6 +284,9 @@ func (s *StorageManager) GetStorageInfo(storage string) (*StorageInfo, error) {
 
 // getStorageContent gets content types for a storage from config
 func (s *StorageManager) getStorageContent(storageName string) []string {
+	if !validStorageName.MatchString(storageName) {
+		return []string{"images"}
+	}
 	result, err := s.client.Run(fmt.Sprintf("grep -A 10 '^%s:' /etc/pve/storage.cfg 2>/dev/null | grep 'content' | head -1", storageName))
 	if err != nil || result.ExitCode != 0 {
 		return []string{"images", "rootdir"}

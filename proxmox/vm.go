@@ -88,7 +88,7 @@ func (c *VMCreator) CreateVM(cfg VMConfig) error {
 	// Build qm create command
 	args := []string{
 		fmt.Sprintf("%d", cfg.VMID),
-		fmt.Sprintf("--name %s", cfg.Name),
+		"--name " + ssh.ShellEscape(cfg.Name),
 		fmt.Sprintf("--memory %d", cfg.RAMGB*1024),
 		fmt.Sprintf("--cores %d", cfg.CPUCores),
 		"--cpu cputype=host",
@@ -98,17 +98,17 @@ func (c *VMCreator) CreateVM(cfg VMConfig) error {
 
 	// Add description if provided
 	if cfg.Description != "" {
-		args = append(args, fmt.Sprintf("--description '%s'", cfg.Description))
+		args = append(args, "--description "+ssh.ShellEscape(cfg.Description))
 	}
 
 	// Add IDE for CD-ROM with ISO
 	if cfg.ISOFile != "" {
 		isoPath := fmt.Sprintf("%s:iso/%s", cfg.ISOStorage, cfg.ISOFile)
-		args = append(args, fmt.Sprintf("--ide2 %s,media=cdrom", isoPath))
+		args = append(args, "--ide2 "+ssh.ShellEscape(isoPath)+",media=cdrom")
 	}
 
 	// Boot order: disk first so after OS install the VM boots from disk, not ISO again
-	args = append(args, "--boot 'order=scsi0;ide2'")
+	args = append(args, "--boot "+ssh.ShellEscape("order=scsi0;ide2"))
 
 	// Add network interfaces
 	for i, net := range cfg.Networks {
@@ -117,23 +117,26 @@ func (c *VMCreator) CreateVM(cfg VMConfig) error {
 			model = "virtio"
 		}
 
-		netArg := fmt.Sprintf("--net%d %s,bridge=%s", i, model, net.Bridge)
+		netValue := fmt.Sprintf("%s,bridge=%s", model, net.Bridge)
 		if net.VLAN > 0 {
-			netArg += fmt.Sprintf(",tag=%d", net.VLAN)
+			netValue += fmt.Sprintf(",tag=%d", net.VLAN)
 		}
 		if net.Firewall {
-			netArg += ",firewall=1"
+			netValue += ",firewall=1"
 		}
-		args = append(args, netArg)
+		args = append(args, fmt.Sprintf("--net%d ", i)+ssh.ShellEscape(netValue))
 	}
 
 	// Create disk
-	diskArg := fmt.Sprintf("--scsi0 %s:%d", cfg.Storage, cfg.DiskGB)
-	args = append(args, diskArg)
+	diskValue := fmt.Sprintf("%s:%d", cfg.Storage, cfg.DiskGB)
+	args = append(args, "--scsi0 "+ssh.ShellEscape(diskValue))
+
+	// Add serial console device for terminal access
+	args = append(args, "--serial0 socket")
 
 	// Add tags
 	if len(cfg.Tags) > 0 {
-		args = append(args, fmt.Sprintf("--tags '%s'", strings.Join(cfg.Tags, ";")))
+		args = append(args, "--tags "+ssh.ShellEscape(strings.Join(cfg.Tags, ";")))
 	}
 
 	// Add start on boot
@@ -171,7 +174,7 @@ func (c *VMCreator) DestroyVM(vmid int) error {
 
 // SetVMTags sets tags on a VM
 func (c *VMCreator) SetVMTags(vmid int, tags []string) error {
-	return c.client.RunQuiet(fmt.Sprintf("qm set %d --tags %s", vmid, strings.Join(tags, ";")))
+	return c.client.RunQuiet(fmt.Sprintf("qm set %d --tags ", vmid) + ssh.ShellEscape(strings.Join(tags, ";")))
 }
 
 // GetVMStatus gets the status of a VM
@@ -246,90 +249,124 @@ func BuildVMConfigForComponent(
 	}
 }
 
-// BuildNetworksForComponent returns the network configuration for a component
+// taggedNetwork pairs a VMNetwork with a stable ID for reordering.
+type taggedNetwork struct {
+	id  string
+	net VMNetwork
+}
+
+// BuildNetworksForComponent returns the network configuration for a component.
+// If netConfig.InterfaceOrder contains an entry for this component type,
+// the returned networks are reordered to match.
 func BuildNetworksForComponent(
 	compType config.ComponentType,
 	netConfig config.NetworkConfig,
 	haMode bool,
 ) []VMNetwork {
-	var networks []VMNetwork
+	var tagged []taggedNetwork
+	baseIdx := 0
 
-	// Helper to add network
-	addNet := func(bridge string, vlan int, name string) {
+	// Helper to add a base (fixed) network
+	addBase := func(bridge string, vlan int, name string) {
 		if bridge != "" {
-			networks = append(networks, VMNetwork{
-				Bridge: bridge,
-				VLAN:   vlan,
-				Model:  "virtio",
-				Name:   name,
+			tagged = append(tagged, taggedNetwork{
+				id:  fmt.Sprintf("base:%d", baseIdx),
+				net: VMNetwork{Bridge: bridge, VLAN: vlan, Model: "virtio", Name: name},
 			})
 		}
+		baseIdx++
+	}
+
+	// Helper to add a WAN network
+	addWAN := func(i int, bridge string, vlan int, name string) {
+		tagged = append(tagged, taggedNetwork{
+			id:  fmt.Sprintf("wan:%d", i),
+			net: VMNetwork{Bridge: bridge, VLAN: vlan, Model: "virtio", Name: name},
+		})
+	}
+
+	// Helper to add an extra network
+	addExtra := func(i int, bridge string, vlan int, name string) {
+		tagged = append(tagged, taggedNetwork{
+			id:  fmt.Sprintf("extra:%d", i),
+			net: VMNetwork{Bridge: bridge, VLAN: vlan, Model: "virtio", Name: name},
+		})
 	}
 
 	switch compType {
 	case config.ComponentDirector:
-		// eth0: Northbound (management)
-		addNet(netConfig.NorthboundBridge, netConfig.NorthboundVLAN, string(NetworkNorthbound))
-		// eth1: Southbound / to router
-		addNet(netConfig.DirectorRouterBridge, netConfig.DirectorRouterVLAN, string(NetworkDirectorRouter))
+		addBase(netConfig.NorthboundBridge, netConfig.NorthboundVLAN, string(NetworkNorthbound))
+		addBase(netConfig.DirectorRouterBridge, netConfig.DirectorRouterVLAN, string(NetworkDirectorRouter))
 
 	case config.ComponentAnalytics:
-		// eth0: Northbound (management)
-		addNet(netConfig.NorthboundBridge, netConfig.NorthboundVLAN, string(NetworkNorthbound))
-		// eth1: Southbound (can share Director's southbound)
-		addNet(netConfig.DirectorRouterBridge, netConfig.DirectorRouterVLAN, string(NetworkAnalyticsSouthbound))
-		// eth2: Cluster sync (optional)
+		addBase(netConfig.NorthboundBridge, netConfig.NorthboundVLAN, string(NetworkNorthbound))
+		addBase(netConfig.DirectorRouterBridge, netConfig.DirectorRouterVLAN, string(NetworkAnalyticsSouthbound))
 		if netConfig.AnalyticsClusterBridge != "" {
-			addNet(netConfig.AnalyticsClusterBridge, netConfig.AnalyticsClusterVLAN, string(NetworkAnalyticsCluster))
+			addExtra(0, netConfig.AnalyticsClusterBridge, netConfig.AnalyticsClusterVLAN, string(NetworkAnalyticsCluster))
 		}
 
 	case config.ComponentController:
-		// eth0: Northbound (management)
-		addNet(netConfig.NorthboundBridge, netConfig.NorthboundVLAN, string(NetworkNorthbound))
-		// eth1: To router
-		addNet(netConfig.ControllerRouterBridge, netConfig.ControllerRouterVLAN, string(NetworkControllerRouter))
-		// eth2-4: WAN interfaces (1-3)
+		addBase(netConfig.NorthboundBridge, netConfig.NorthboundVLAN, string(NetworkNorthbound))
+		addBase(netConfig.ControllerRouterBridge, netConfig.ControllerRouterVLAN, string(NetworkControllerRouter))
 		for i, bridge := range netConfig.ControllerWANBridges {
 			vlan := 0
 			if i < len(netConfig.ControllerWANVLANs) {
 				vlan = netConfig.ControllerWANVLANs[i]
 			}
-			addNet(bridge, vlan, fmt.Sprintf("%s-%d", NetworkControllerWAN, i+1))
+			addWAN(i, bridge, vlan, fmt.Sprintf("%s-%d", NetworkControllerWAN, i+1))
 		}
 
 	case config.ComponentRouter:
-		// eth0: Northbound (management) - same bridge as Director/Analytics
-		addNet(netConfig.NorthboundBridge, netConfig.NorthboundVLAN, string(NetworkNorthbound))
-		// eth1: To Director
-		addNet(netConfig.DirectorRouterBridge, netConfig.DirectorRouterVLAN, string(NetworkDirectorRouter))
-		// eth2: To Controller
-		addNet(netConfig.ControllerRouterBridge, netConfig.ControllerRouterVLAN, string(NetworkControllerRouter))
-		// eth3: HA interface (only if HA mode and RouterHA network is configured)
+		addBase(netConfig.NorthboundBridge, netConfig.NorthboundVLAN, string(NetworkNorthbound))
+		addBase(netConfig.DirectorRouterBridge, netConfig.DirectorRouterVLAN, string(NetworkDirectorRouter))
+		addBase(netConfig.ControllerRouterBridge, netConfig.ControllerRouterVLAN, string(NetworkControllerRouter))
 		if haMode && netConfig.RouterHABridge != "" {
-			addNet(netConfig.RouterHABridge, netConfig.RouterHAVLAN, string(NetworkRouterHA))
+			addExtra(0, netConfig.RouterHABridge, netConfig.RouterHAVLAN, string(NetworkRouterHA))
 		}
 
 	case config.ComponentConcerto:
-		// eth0: Northbound (management)
-		addNet(netConfig.NorthboundBridge, netConfig.NorthboundVLAN, string(NetworkNorthbound))
-		// eth1: Southbound
-		addNet(netConfig.DirectorRouterBridge, netConfig.DirectorRouterVLAN, string(NetworkConcertoSouthbound))
+		addBase(netConfig.NorthboundBridge, netConfig.NorthboundVLAN, string(NetworkNorthbound))
+		addBase(netConfig.DirectorRouterBridge, netConfig.DirectorRouterVLAN, string(NetworkConcertoSouthbound))
 
 	case config.ComponentFlexVNF:
-		// eth0: Management
-		addNet(netConfig.NorthboundBridge, netConfig.NorthboundVLAN, string(NetworkNorthbound))
-		// eth1: WAN
+		addBase(netConfig.NorthboundBridge, netConfig.NorthboundVLAN, string(NetworkNorthbound))
 		if len(netConfig.ControllerWANBridges) > 0 {
 			vlan := 0
 			if len(netConfig.ControllerWANVLANs) > 0 {
 				vlan = netConfig.ControllerWANVLANs[0]
 			}
-			addNet(netConfig.ControllerWANBridges[0], vlan, string(NetworkFlexVNFWAN))
+			addWAN(0, netConfig.ControllerWANBridges[0], vlan, string(NetworkFlexVNFWAN))
 		}
-		// eth2: LAN - typically a separate bridge/VLAN
-		// This should be configurable by the user
 	}
 
+	// Apply stored interface order if present
+	order := netConfig.InterfaceOrder[string(compType)]
+	if len(order) > 0 {
+		byID := make(map[string]taggedNetwork, len(tagged))
+		for _, t := range tagged {
+			byID[t.id] = t
+		}
+
+		reordered := make([]taggedNetwork, 0, len(tagged))
+		for _, id := range order {
+			if t, ok := byID[id]; ok {
+				reordered = append(reordered, t)
+				delete(byID, id)
+			}
+		}
+		// Append any remaining (new interfaces not in stored order)
+		for _, t := range tagged {
+			if _, ok := byID[t.id]; ok {
+				reordered = append(reordered, t)
+			}
+		}
+		tagged = reordered
+	}
+
+	networks := make([]VMNetwork, len(tagged))
+	for i, t := range tagged {
+		networks[i] = t.net
+	}
 	return networks
 }
 

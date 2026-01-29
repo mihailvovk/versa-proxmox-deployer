@@ -5,6 +5,8 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Versa HeadEnd Deployer</title>
     <link rel="stylesheet" href="style.css">
+    <link rel="stylesheet" href="vendor/xterm.css">
+    <link rel="stylesheet" href="console.css">
 </head>
 <body>
     <header>
@@ -48,6 +50,7 @@
                                 <input type="checkbox" id="save-password" checked>
                                 Remember credentials
                             </label>
+                            <small class="credential-warning">Credentials stored as plaintext in ~/.versa-deployer/config.json</small>
                         </div>
                         <div class="form-group">
                             <button type="submit" id="connect-btn" class="btn btn-primary">Connect</button>
@@ -289,8 +292,32 @@
                 <div id="deploy-result" class="hidden"></div>
             </div>
         </section>
+        <!-- Console Modal (fullscreen overlay) -->
+        <div id="console-modal" class="hidden">
+            <div class="console-header">
+                <div class="console-header-left">
+                    <span id="console-title"></span>
+                    <span id="console-status" class="console-status disconnected">Disconnected</span>
+                </div>
+                <button class="console-close-btn" onclick="closeConsole()" title="Close (Esc)">&times;</button>
+            </div>
+            <div class="console-body">
+                <div id="console-terminal-container"></div>
+            </div>
+        </div>
     </main>
 
+    <script src="vendor/xterm.js"></script>
+    <script src="vendor/xterm-addon-fit.js"></script>
+    <script src="vendor/xterm-addon-web-links.js"></script>
     <script src="app.js"></script>
+    <script src="connect.js"></script>
+    <script src="discovery.js"></script>
+    <script src="sources.js"></script>
+    <script src="components.js"></script>
+    <script src="network.js"></script>
+    <script src="deploy.js"></script>
+    <script src="deployments.js"></script>
+    <script src="console.js"></script>
 </body>
 </html>

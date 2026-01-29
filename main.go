@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"log/slog"
 	"os"
 
 	"github.com/spf13/cobra"
@@ -12,7 +13,6 @@ import (
 	"github.com/mihailvovk/versa-proxmox-deployer/downloader"
 	"github.com/mihailvovk/versa-proxmox-deployer/sources"
 	"github.com/mihailvovk/versa-proxmox-deployer/ssh"
-	"github.com/mihailvovk/versa-proxmox-deployer/ui"
 	"github.com/mihailvovk/versa-proxmox-deployer/web"
 )
 
@@ -97,9 +97,9 @@ func main() {
 
 	// Add source command
 	addSourceCmd := &cobra.Command{
-		Use:   "add-source [url]",
+		Use:   "add-source <url>",
 		Short: "Add an image source",
-		Args:  cobra.MaximumNArgs(1),
+		Args:  cobra.ExactArgs(1),
 		Run:   runAddSource,
 	}
 	rootCmd.AddCommand(addSourceCmd)
@@ -113,7 +113,7 @@ func main() {
 func runWebUI(httpPort, httpsPort int) {
 	cfg, err := config.Load()
 	if err != nil {
-		fmt.Printf("Warning: Could not load config: %v\n", err)
+		slog.Warn("could not load config", "error", err)
 		cfg = &config.Config{}
 	}
 
@@ -147,10 +147,11 @@ func runDeploy(cmd *cobra.Command, args []string) {
 
 	// Connect
 	sshOpts := ssh.ClientOptions{
-		Host:     host,
-		User:     user,
-		KeyPath:  keyPath,
-		Password: password,
+		Host:         host,
+		User:         user,
+		KeyPath:      keyPath,
+		Password:     password,
+		HostKeyCheck: true,
 	}
 
 	client, err := ssh.NewClient(sshOpts)
@@ -267,7 +268,28 @@ func runStatus(cmd *cobra.Command, args []string) {
 		os.Exit(1)
 	}
 
-	ui.PrintHeadEndStatus(status)
+	fmt.Printf("Overall Health: %s\n", status.OverallHealth)
+	fmt.Printf("Components: %d total, %d healthy, %d unhealthy\n",
+		status.TotalComponents, status.HealthyCount, status.UnhealthyCount)
+
+	printComp := func(c *director.ComponentStatus) {
+		if c == nil {
+			return
+		}
+		fmt.Printf("  %-15s  %-15s  %-10s  %-12s  %s\n", c.Name, c.IP, c.Status, c.Version, c.Uptime)
+	}
+	fmt.Printf("\n  %-15s  %-15s  %-10s  %-12s  %s\n", "Component", "IP", "Status", "Version", "Uptime")
+	printComp(status.Director)
+	printComp(status.Analytics)
+	for _, ctrl := range status.Controllers {
+		printComp(ctrl)
+	}
+	for _, router := range status.Routers {
+		printComp(router)
+	}
+	if status.Concerto != nil {
+		printComp(status.Concerto)
+	}
 
 	// Also get branch status
 	branchStatus, err := client.GetBranchStatus()
@@ -293,20 +315,33 @@ func runReleases(cmd *cobra.Command, args []string) {
 		os.Exit(1)
 	}
 
-	ui.PrintSourcesTable(collection.Sources)
+	fmt.Printf("\n%-30s  %-10s  %-6s  %-6s\n", "Source", "Type", "ISOs", "MD5s")
+	for _, s := range collection.Sources {
+		name := s.Name
+		if len(name) > 30 {
+			name = name[:27] + "..."
+		}
+		fmt.Printf("%-30s  %-10s  %-6d  %-6d\n", name, s.Type, s.ISOCount, s.MD5Count)
+	}
 
-	if len(collection.Director) > 0 {
-		ui.PrintISOTable(collection.Director, "Director")
+	printISOs := func(isos []sources.ISOFile, label string) {
+		if len(isos) == 0 {
+			return
+		}
+		fmt.Printf("\n%s ISOs:\n", label)
+		fmt.Printf("  %-12s  %-20s  %-10s\n", "Version", "Source", "Size")
+		for _, iso := range isos {
+			srcName := iso.SourceName
+			if len(srcName) > 20 {
+				srcName = srcName[:17] + "..."
+			}
+			fmt.Printf("  %-12s  %-20s  %-10s\n", iso.Version, srcName, sources.FormatFileSize(iso.Size))
+		}
 	}
-	if len(collection.Analytics) > 0 {
-		ui.PrintISOTable(collection.Analytics, "Analytics")
-	}
-	if len(collection.FlexVNF) > 0 {
-		ui.PrintISOTable(collection.FlexVNF, "FlexVNF/Controller/Router")
-	}
-	if len(collection.Concerto) > 0 {
-		ui.PrintISOTable(collection.Concerto, "Concerto")
-	}
+	printISOs(collection.Director, "Director")
+	printISOs(collection.Analytics, "Analytics")
+	printISOs(collection.FlexVNF, "FlexVNF/Controller/Router")
+	printISOs(collection.Concerto, "Concerto")
 }
 
 func runGenerateMD5(cmd *cobra.Command, args []string) {
@@ -333,23 +368,15 @@ func runGenerateMD5(cmd *cobra.Command, args []string) {
 func runAddSource(cmd *cobra.Command, args []string) {
 	cfg, _ := config.Load()
 
-	var source *config.ImageSource
-	var err error
+	if len(args) == 0 {
+		fmt.Fprintln(os.Stderr, "Error: URL argument is required (e.g., versa-deployer add-source https://...)")
+		os.Exit(1)
+	}
 
-	if len(args) > 0 {
-		// URL provided as argument
-		sourceType := sources.DetectSourceType(args[0])
-		source = &config.ImageSource{
-			URL:  args[0],
-			Type: string(sourceType),
-		}
-	} else {
-		// Interactive prompt
-		source, err = ui.AddSourcePrompt()
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			os.Exit(1)
-		}
+	sourceType := sources.DetectSourceType(args[0])
+	source := &config.ImageSource{
+		URL:  args[0],
+		Type: string(sourceType),
 	}
 
 	// Validate source

@@ -6,10 +6,11 @@ A single-binary tool that automates Versa Networks HeadEnd deployment on Proxmox
 
 - **Web UI** - Browser-based interface at `http://localhost:1050`
 - **Auto-discovery** - Detects Proxmox nodes, storage pools, network bridges, and existing deployments
+- **Serial Console** - Open a live terminal to any running VM directly from the browser (xterm.js)
 - **Multi-source ISO scanning** - Dropbox, HTTP, SFTP, and local folder sources
 - **Standard and HA modes** - Deploy single instances or full HA with 2x redundancy
 - **Network topology diagram** - Visual SVG diagram of VM interconnections
-- **Interface reordering** - Drag interfaces to control eth assignment order
+- **Interface reordering** - Reorder all network interfaces per instance to control eth assignment
 - **Deployment management** - List, stop, and delete previously deployed VMs
 - **Auto rollback** - Cleans up on deployment failure
 - **VM tagging** - All VMs tagged for identification and grouped by deployment
@@ -69,7 +70,7 @@ Open `http://localhost:1050` in your browser. The tool will guide you through:
 # List available ISOs from configured sources
 ./versa-deployer releases
 
-# Add an image source (saved to config)
+# Add an image source (URL required, saved to config)
 ./versa-deployer add-source "https://www.dropbox.com/scl/fo/..."
 ./versa-deployer add-source "sftp://admin@192.168.1.50/var/images/"
 ./versa-deployer add-source "/path/to/local/isos"
@@ -166,7 +167,7 @@ The Manage Deployments section in the web UI uses these tags to list, stop, and 
 
 ### Requirements
 
-- Go 1.21+
+- Go 1.22+
 
 ### Build for Current Platform
 
@@ -200,11 +201,11 @@ make help        # Show all targets
 
 ## Post-Deployment
 
-After deployment, VMs boot from ISO. Complete the Versa installer via Proxmox console:
+After deployment, VMs boot from ISO. Complete the Versa installer using any of:
 
-```
-https://<proxmox-host>:8006/#v1:0:qemu/<vmid>
-```
+- **Built-in console** - Click the Console button next to any running VM in the Manage Deployments section
+- **Proxmox web UI** - `https://<proxmox-host>:8006/#v1:0:qemu/<vmid>`
+- **CLI** - `qm terminal <vmid>` via SSH
 
 ## Requirements
 
