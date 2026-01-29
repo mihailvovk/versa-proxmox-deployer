@@ -1,0 +1,296 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Versa HeadEnd Deployer</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <header>
+        <h1>Versa HeadEnd Deployer</h1>
+        <span id="connection-status" class="status disconnected">Disconnected</span>
+    </header>
+
+    <main>
+        <!-- STEP 1: CONNECTION -->
+        <section id="step-connection" class="step">
+            <h2><span class="step-num">1</span> Proxmox Connection</h2>
+            <div class="step-content">
+                <form id="connect-form">
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label for="host">Host</label>
+                            <input type="text" id="host" placeholder="172.16.0.145" required>
+                        </div>
+                        <div class="form-group">
+                            <label for="user">User</label>
+                            <input type="text" id="user" placeholder="root" value="root">
+                        </div>
+                        <div class="form-group">
+                            <label for="password">Password</label>
+                            <input type="password" id="password" placeholder="SSH password">
+                        </div>
+                    </div>
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label>SSH Key (optional)</label>
+                            <div class="ssh-key-row">
+                                <span id="ssh-key-status" class="ssh-key-status">No key</span>
+                                <label class="btn btn-small btn-secondary ssh-key-upload-label">
+                                    Upload Key
+                                    <input type="file" id="ssh-key-file" class="hidden">
+                                </label>
+                            </div>
+                        </div>
+                        <div class="form-group checkbox-group">
+                            <label>
+                                <input type="checkbox" id="save-password" checked>
+                                Remember credentials
+                            </label>
+                        </div>
+                        <div class="form-group">
+                            <button type="submit" id="connect-btn" class="btn btn-primary">Connect</button>
+                        </div>
+                    </div>
+                    <div id="connect-error" class="error-msg hidden"></div>
+                </form>
+            </div>
+        </section>
+
+        <!-- STEP 2: ENVIRONMENT -->
+        <section id="step-environment" class="step hidden">
+            <h2><span class="step-num">2</span> Environment</h2>
+            <div class="step-content">
+                <div id="discovery-loading" class="loading">Discovering Proxmox environment...</div>
+                <div id="discovery-error" class="error-msg hidden"></div>
+                <div id="discovery-results" class="hidden">
+                    <div class="info-bar">
+                        <span id="pve-version"></span>
+                        <span id="cluster-info"></span>
+                    </div>
+                    <div class="card-grid">
+                        <div class="card">
+                            <h3>Nodes</h3>
+                            <table id="nodes-table">
+                                <thead><tr><th>Name</th><th>Status</th><th>CPU</th><th>RAM</th><th>VMs</th></tr></thead>
+                                <tbody></tbody>
+                            </table>
+                        </div>
+                        <div class="card">
+                            <h3>Storage</h3>
+                            <table id="storage-table">
+                                <thead><tr><th>Name</th><th>Type</th><th>Available</th><th>Total</th></tr></thead>
+                                <tbody></tbody>
+                            </table>
+                        </div>
+                        <div class="card">
+                            <h3>Networks
+                                <button id="create-network-btn" class="btn btn-small btn-secondary">+ Create Bridge</button>
+                            </h3>
+                            <table id="networks-table">
+                                <thead><tr><th>Name</th><th>Interface</th><th>CIDR</th><th>VLAN-Aware</th></tr></thead>
+                                <tbody></tbody>
+                            </table>
+                        </div>
+                    </div>
+
+                    <!-- Image Sources -->
+                    <div class="sources-section">
+                        <h3>Image Sources
+                            <button id="add-source-btn" class="btn btn-small btn-secondary">+ Add Source</button>
+                            <button id="add-local-btn" class="btn btn-small btn-secondary">+ Add Local Folder</button>
+                            <button id="rescan-sources-btn" class="btn btn-small btn-secondary">Rescan</button>
+                        </h3>
+                        <div id="sources-list"></div>
+                        <div id="images-status" class="loading">Scanning image sources...</div>
+                        <div id="images-summary" class="hidden"></div>
+                    </div>
+
+                    <!-- Existing Deployments -->
+                    <div class="deployments-section">
+                        <h3>Deployed Instances
+                            <button id="refresh-deployments-btn" class="btn btn-small btn-secondary">Refresh</button>
+                        </h3>
+                        <div id="deployments-loading" class="loading">Loading deployments...</div>
+                        <div id="deployments-empty" class="hidden">
+                            <p class="text-muted" style="padding:4px 0;font-size:13px">No instances deployed by this tool.</p>
+                        </div>
+                        <div id="deployments-list"></div>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- Create Network Modal -->
+        <div id="create-network-modal" class="modal hidden">
+            <div class="modal-content">
+                <h3>Create Network Bridge</h3>
+                <form id="create-network-form">
+                    <div class="form-group">
+                        <label for="net-name">Bridge Name</label>
+                        <input type="text" id="net-name" placeholder="vmbr2" required>
+                    </div>
+                    <div class="form-group">
+                        <label for="net-node">Node</label>
+                        <select id="net-node" required></select>
+                    </div>
+                    <div class="form-group checkbox-group">
+                        <label>
+                            <input type="checkbox" id="net-vlan-aware" checked>
+                            VLAN-aware
+                        </label>
+                    </div>
+                    <div class="form-group">
+                        <label for="net-interface">Physical Interface (optional)</label>
+                        <input type="text" id="net-interface" placeholder="e.g. eno1">
+                    </div>
+                    <div class="form-actions">
+                        <button type="button" class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+                        <button type="submit" class="btn btn-primary">Create</button>
+                    </div>
+                    <div id="create-network-error" class="error-msg hidden"></div>
+                </form>
+            </div>
+        </div>
+
+        <!-- Add Source Modal -->
+        <div id="add-source-modal" class="modal hidden">
+            <div class="modal-content">
+                <h3>Add Image Source</h3>
+                <form id="add-source-form">
+                    <div class="form-group">
+                        <label for="source-url">URL or Path</label>
+                        <input type="text" id="source-url" placeholder="https://dropbox.com/... or sftp://user@host/path or /local/path" required>
+                    </div>
+                    <div class="form-group">
+                        <label for="source-name">Name (optional)</label>
+                        <input type="text" id="source-name" placeholder="Auto-detected from URL">
+                    </div>
+                    <div id="source-type-display" class="info-bar hidden" style="margin-bottom:12px">
+                        <span id="source-detected-type"></span>
+                    </div>
+                    <div class="form-actions">
+                        <button type="button" class="btn btn-secondary" onclick="closeSourceModal()">Cancel</button>
+                        <button type="submit" class="btn btn-primary" id="add-source-submit-btn">Add & Test</button>
+                    </div>
+                    <div id="add-source-error" class="error-msg hidden"></div>
+                </form>
+            </div>
+        </div>
+
+        <!-- STEP 3: DEPLOYMENT MODE -->
+        <section id="step-mode" class="step hidden">
+            <h2><span class="step-num">3</span> Deployment Mode</h2>
+            <div class="step-content">
+                <div class="mode-selector">
+                    <label class="mode-option selected" data-mode="standard">
+                        <input type="radio" name="deploy-mode" value="standard" checked>
+                        <div class="mode-card">
+                            <strong>Standard HeadEnd</strong>
+                            <p>Director + Analytics + Controller + Router (+ optional Concerto)</p>
+                        </div>
+                    </label>
+                    <label class="mode-option" data-mode="ha">
+                        <input type="radio" name="deploy-mode" value="ha">
+                        <div class="mode-card">
+                            <strong>HA HeadEnd</strong>
+                            <p>Director x2, Analytics x2, Controller x2, Router x2 (+ optional Concerto x3)</p>
+                        </div>
+                    </label>
+                    <label class="mode-option" data-mode="single">
+                        <input type="radio" name="deploy-mode" value="single">
+                        <div class="mode-card">
+                            <strong>Single Instance</strong>
+                            <p>Any single component for testing or replacement</p>
+                        </div>
+                    </label>
+                </div>
+                <!-- Single instance component picker -->
+                <div id="single-component-picker" class="hidden single-picker">
+                    <label for="single-component">Which component to deploy:</label>
+                    <div class="single-picker-options">
+                        <label class="single-option"><input type="radio" name="single-comp" value="director" checked> Director</label>
+                        <label class="single-option"><input type="radio" name="single-comp" value="analytics"> Analytics</label>
+                        <label class="single-option"><input type="radio" name="single-comp" value="controller"> Controller</label>
+                        <label class="single-option"><input type="radio" name="single-comp" value="router"> Router</label>
+                        <label class="single-option"><input type="radio" name="single-comp" value="concerto"> Concerto</label>
+                        <label class="single-option"><input type="radio" name="single-comp" value="flexvnf"> FlexVNF</label>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- STEP 4: COMPONENTS -->
+        <section id="step-components" class="step hidden">
+            <h2><span class="step-num">4</span> Components</h2>
+            <div class="step-content">
+                <div class="form-row">
+                    <div class="form-group">
+                        <label for="deploy-prefix">VM Name Prefix</label>
+                        <input type="text" id="deploy-prefix" value="" placeholder="v-a1b2c3d4">
+                    </div>
+                    <div class="form-group">
+                        <label for="deploy-storage">Storage Pool</label>
+                        <select id="deploy-storage"></select>
+                    </div>
+                </div>
+                <table id="components-table" class="editable-table">
+                    <thead>
+                        <tr>
+                            <th>Enable</th>
+                            <th>Component</th>
+                            <th>Count</th>
+                            <th>CPU</th>
+                            <th>RAM (GB)</th>
+                            <th>Disk (GB)</th>
+                            <th>Node</th>
+                            <th>ISO</th>
+                        </tr>
+                    </thead>
+                    <tbody id="components-body"></tbody>
+                </table>
+            </div>
+        </section>
+
+        <!-- STEP 5: NETWORKS -->
+        <section id="step-networks" class="step hidden">
+            <h2><span class="step-num">5</span> Networks</h2>
+            <div class="step-content">
+                <div id="network-config">
+                    <div id="topology-diagram">
+                        <!-- SVG generated dynamically -->
+                    </div>
+                    <div id="network-config-panel">
+                        <div id="bridge-assignments">
+                            <!-- Dynamically populated -->
+                        </div>
+                        <div id="instance-preview">
+                            <!-- Dynamically populated -->
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- STEP 6: REVIEW & DEPLOY -->
+        <section id="step-deploy" class="step hidden">
+            <h2><span class="step-num">6</span> Review & Deploy</h2>
+            <div class="step-content">
+                <div id="deploy-summary"></div>
+                <button id="deploy-btn" class="btn btn-primary btn-large">Deploy</button>
+                <div id="deploy-progress" class="hidden">
+                    <div class="progress-bar">
+                        <div class="progress-fill" id="progress-fill"></div>
+                    </div>
+                    <div id="progress-text"></div>
+                    <div id="progress-log"></div>
+                </div>
+                <div id="deploy-result" class="hidden"></div>
+            </div>
+        </section>
+    </main>
+
+    <script src="app.js"></script>
+</body>
+</html>

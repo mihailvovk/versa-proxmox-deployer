@@ -1,0 +1,27 @@
+# Binaries
+versa-deployer
+versa-deployer.exe
+dist/
+
+# Config (contains user-specific settings)
+config.json
+
+# Downloaded images
+images/
+
+# Logs
+logs/
+
+# TLS certs (auto-generated)
+server.crt
+server.key
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
