@@ -19,7 +19,7 @@ A single-binary tool that automates Versa Networks HeadEnd deployment on Proxmox
 
 ### Download
 
-Grab the binary for your platform from the [Releases](https://github.com/oliverwhk/versa-proxmox-deployer/releases) page.
+Grab the binary for your platform from the [Releases](https://github.com/mihailvovk/versa-proxmox-deployer/releases) page.
 
 ### Run
 
