@@ -15,6 +15,12 @@ A single-binary tool that automates Versa Networks HeadEnd deployment on Proxmox
 - **VM tagging** - All VMs tagged for identification and grouped by deployment
 - **Cross-platform** - Runs on macOS, Linux, and Windows
 
+## Screenshots
+
+![Connection](screenshots/01-connect.png)
+
+![Full UI](screenshots/02-full.png)
+
 ## Quick Start
 
 ### Download
