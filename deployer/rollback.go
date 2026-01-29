@@ -4,8 +4,8 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/oliverwhk/versa-proxmox-deployer/proxmox"
-	"github.com/oliverwhk/versa-proxmox-deployer/ssh"
+	"github.com/mihailvovk/versa-proxmox-deployer/proxmox"
+	"github.com/mihailvovk/versa-proxmox-deployer/ssh"
 )
 
 // RollbackManager handles deployment rollback operations

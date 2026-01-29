@@ -5,10 +5,10 @@ import (
 	"strings"
 
 	"github.com/charmbracelet/lipgloss"
-	"github.com/oliverwhk/versa-proxmox-deployer/config"
-	"github.com/oliverwhk/versa-proxmox-deployer/director"
-	"github.com/oliverwhk/versa-proxmox-deployer/proxmox"
-	"github.com/oliverwhk/versa-proxmox-deployer/sources"
+	"github.com/mihailvovk/versa-proxmox-deployer/config"
+	"github.com/mihailvovk/versa-proxmox-deployer/director"
+	"github.com/mihailvovk/versa-proxmox-deployer/proxmox"
+	"github.com/mihailvovk/versa-proxmox-deployer/sources"
 )
 
 var (

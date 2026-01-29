@@ -15,11 +15,11 @@ import (
 	"sync"
 	"time"
 
-	"github.com/oliverwhk/versa-proxmox-deployer/config"
-	"github.com/oliverwhk/versa-proxmox-deployer/deployer"
-	"github.com/oliverwhk/versa-proxmox-deployer/proxmox"
-	"github.com/oliverwhk/versa-proxmox-deployer/sources"
-	"github.com/oliverwhk/versa-proxmox-deployer/ssh"
+	"github.com/mihailvovk/versa-proxmox-deployer/config"
+	"github.com/mihailvovk/versa-proxmox-deployer/deployer"
+	"github.com/mihailvovk/versa-proxmox-deployer/proxmox"
+	"github.com/mihailvovk/versa-proxmox-deployer/sources"
+	"github.com/mihailvovk/versa-proxmox-deployer/ssh"
 )
 
 //go:embed static/*

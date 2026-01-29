@@ -5,8 +5,8 @@ import (
 	"os"
 	"strings"
 
-	"github.com/oliverwhk/versa-proxmox-deployer/config"
-	"github.com/oliverwhk/versa-proxmox-deployer/ssh"
+	"github.com/mihailvovk/versa-proxmox-deployer/config"
+	"github.com/mihailvovk/versa-proxmox-deployer/ssh"
 )
 
 // SourceType represents the type of image source

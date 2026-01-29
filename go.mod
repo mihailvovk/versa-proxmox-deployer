@@ -1,4 +1,4 @@
-module github.com/oliverwhk/versa-proxmox-deployer
+module github.com/mihailvovk/versa-proxmox-deployer
 
 go 1.22
 

@@ -3,8 +3,8 @@ package deployer
 import (
 	"fmt"
 
-	"github.com/oliverwhk/versa-proxmox-deployer/config"
-	"github.com/oliverwhk/versa-proxmox-deployer/proxmox"
+	"github.com/mihailvovk/versa-proxmox-deployer/config"
+	"github.com/mihailvovk/versa-proxmox-deployer/proxmox"
 )
 
 // NetworkPlan holds the planned network configuration

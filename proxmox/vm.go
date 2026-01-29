@@ -4,8 +4,8 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/oliverwhk/versa-proxmox-deployer/config"
-	"github.com/oliverwhk/versa-proxmox-deployer/ssh"
+	"github.com/mihailvovk/versa-proxmox-deployer/config"
+	"github.com/mihailvovk/versa-proxmox-deployer/ssh"
 )
 
 // VMCreator handles VM creation on Proxmox

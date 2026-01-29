@@ -3,8 +3,8 @@ package deployer
 import (
 	"sort"
 
-	"github.com/oliverwhk/versa-proxmox-deployer/config"
-	"github.com/oliverwhk/versa-proxmox-deployer/proxmox"
+	"github.com/mihailvovk/versa-proxmox-deployer/config"
+	"github.com/mihailvovk/versa-proxmox-deployer/proxmox"
 )
 
 // DistributionStrategy defines how VMs are distributed across nodes

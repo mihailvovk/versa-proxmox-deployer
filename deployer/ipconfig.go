@@ -5,7 +5,7 @@ import (
 	"net"
 	"strings"
 
-	"github.com/oliverwhk/versa-proxmox-deployer/config"
+	"github.com/mihailvovk/versa-proxmox-deployer/config"
 )
 
 // IPPlan holds IP address assignments for deployment

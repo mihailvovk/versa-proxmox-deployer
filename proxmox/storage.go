@@ -10,7 +10,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/oliverwhk/versa-proxmox-deployer/ssh"
+	"github.com/mihailvovk/versa-proxmox-deployer/ssh"
 )
 
 // StorageManager handles storage operations on Proxmox

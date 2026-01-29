@@ -7,8 +7,8 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/oliverwhk/versa-proxmox-deployer/config"
-	"github.com/oliverwhk/versa-proxmox-deployer/ssh"
+	"github.com/mihailvovk/versa-proxmox-deployer/config"
+	"github.com/mihailvovk/versa-proxmox-deployer/ssh"
 )
 
 // ProxmoxInfo holds discovered Proxmox environment information

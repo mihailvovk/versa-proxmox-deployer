@@ -6,14 +6,14 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/oliverwhk/versa-proxmox-deployer/config"
-	"github.com/oliverwhk/versa-proxmox-deployer/deployer"
-	"github.com/oliverwhk/versa-proxmox-deployer/director"
-	"github.com/oliverwhk/versa-proxmox-deployer/downloader"
-	"github.com/oliverwhk/versa-proxmox-deployer/sources"
-	"github.com/oliverwhk/versa-proxmox-deployer/ssh"
-	"github.com/oliverwhk/versa-proxmox-deployer/ui"
-	"github.com/oliverwhk/versa-proxmox-deployer/web"
+	"github.com/mihailvovk/versa-proxmox-deployer/config"
+	"github.com/mihailvovk/versa-proxmox-deployer/deployer"
+	"github.com/mihailvovk/versa-proxmox-deployer/director"
+	"github.com/mihailvovk/versa-proxmox-deployer/downloader"
+	"github.com/mihailvovk/versa-proxmox-deployer/sources"
+	"github.com/mihailvovk/versa-proxmox-deployer/ssh"
+	"github.com/mihailvovk/versa-proxmox-deployer/ui"
+	"github.com/mihailvovk/versa-proxmox-deployer/web"
 )
 
 var (

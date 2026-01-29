@@ -7,7 +7,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/oliverwhk/versa-proxmox-deployer/config"
+	"github.com/mihailvovk/versa-proxmox-deployer/config"
 )
 
 // ImageSource represents a source for Versa ISO images

@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/oliverwhk/versa-proxmox-deployer/config"
+	"github.com/mihailvovk/versa-proxmox-deployer/config"
 )
 
 // LocalSource represents a local filesystem source for ISOs
