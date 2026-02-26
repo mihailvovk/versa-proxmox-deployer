@@ -183,7 +183,7 @@ func (s *SFTPSource) walkDir(client *sftp.Client, path string, fn func(path stri
 	}
 
 	for _, entry := range entries {
-		fullPath := filepath.Join(path, entry.Name())
+		fullPath := path + "/" + entry.Name()
 		if entry.IsDir() {
 			// Recurse into subdirectory
 			s.walkDir(client, fullPath, fn)
@@ -227,7 +227,7 @@ func (s *SFTPSource) Download(iso ISOFile, destPath string, progress func(downlo
 
 	remotePath := iso.SourceURL
 	if remotePath == "" {
-		remotePath = filepath.Join(s.path, iso.Filename)
+		remotePath = s.path + "/" + iso.Filename
 	}
 
 	// Open remote file
@@ -294,6 +294,6 @@ func (s *SFTPSource) GetMD5(isoFilename string) (string, error) {
 	}
 	defer cleanup()
 
-	md5Path := filepath.Join(s.path, isoFilename+".md5")
+	md5Path := s.path + "/" + isoFilename + ".md5"
 	return s.readRemoteMD5(client, md5Path)
 }

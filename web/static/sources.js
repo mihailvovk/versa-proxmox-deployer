@@ -23,25 +23,30 @@ async function renderSourcesList() {
     }
 
     container.innerHTML = '';
-    srcs.forEach(src => {
+    srcs.forEach((src, idx) => {
         const item = document.createElement('div');
         item.className = 'source-item';
         item.innerHTML = `
             <span class="source-type">${esc(src.Type || 'auto')}</span>
             <span class="source-name">${esc(src.Name || '')}</span>
             <span class="source-url" title="${esc(src.URL)}">${esc(src.URL)}</span>
-            <button class="btn-remove" data-url="${esc(src.URL)}">Remove</button>
         `;
-        container.appendChild(item);
-    });
-
-    // Bind remove buttons
-    container.querySelectorAll('.btn-remove').forEach(btn => {
-        btn.addEventListener('click', async (e) => {
-            const url = e.target.dataset.url;
-            await api('DELETE', '/api/sources', { url });
+        const removeBtn = document.createElement('button');
+        removeBtn.className = 'btn-remove';
+        removeBtn.textContent = 'Remove';
+        removeBtn.addEventListener('click', async () => {
+            const label = src.Name || src.URL;
+            if (!confirm('Remove source: ' + label + '?')) return;
+            removeBtn.disabled = true;
+            removeBtn.textContent = 'Removing...';
+            const result = await api('DELETE', '/api/sources', { url: src.URL, index: idx });
+            if (result.sources) {
+                state.configSources = result.sources;
+            }
             renderSourcesList();
         });
+        item.appendChild(removeBtn);
+        container.appendChild(item);
     });
 }
 
@@ -61,7 +66,7 @@ function showSourceModal(mode) {
         typeDisplay.classList.remove('hidden');
     } else {
         titleEl.textContent = 'Add Image Source';
-        urlInput.placeholder = 'https://dropbox.com/... or sftp://user@host/path';
+        urlInput.placeholder = 'https://... or s3://bucket/prefix or sftp://user@host/path';
         typeDisplay.classList.add('hidden');
     }
 }

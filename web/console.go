@@ -102,16 +102,41 @@ func (s *Server) handleConsoleSerial(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	command := fmt.Sprintf("qm terminal %d", vmid)
+	// Send initial status to the terminal
+	wsConn.WriteJSON(consoleMessage{
+		Type: "data",
+		Data: fmt.Sprintf("Connecting to VM %d serial console...\r\n", vmid),
+	})
+
+	// Try connecting directly to the QEMU serial socket first (most reliable),
+	// then fall back to qm terminal if the socket doesn't exist.
+	// On PVE 8.x, qm terminal uses a termproxy wrapper that doesn't pipe
+	// output through stdout, so direct socket connection is preferred.
+	socketPath := fmt.Sprintf("/var/run/qemu-server/%d.serial0", vmid)
+	command := fmt.Sprintf(
+		"if [ -S '%s' ]; then socat -,raw,echo=0 UNIX-CONNECT:'%s'; "+
+			"elif command -v miniterm >/dev/null 2>&1; then miniterm UNIX:'%s'; "+
+			"else qm terminal %d; fi",
+		socketPath, socketPath, socketPath, vmid,
+	)
 
 	// Create PTY session
 	pty, err := ssh.NewPTYSession(s.sshClient, command, cols, rows)
 	if err != nil {
 		slog.Error("console serial: PTY creation failed", "error", err, "vmid", vmid, "command", command)
+		wsConn.WriteJSON(consoleMessage{
+			Type: "data",
+			Data: fmt.Sprintf("\r\n\x1b[31mFailed to open terminal: %v\x1b[0m\r\n", err),
+		})
 		wsConn.WriteJSON(consoleMessage{Type: "error", Message: fmt.Sprintf("Failed to open terminal: %v", err)})
 		wsConn.Close()
 		return
 	}
+
+	wsConn.WriteJSON(consoleMessage{
+		Type: "data",
+		Data: "Connected. Press Enter to activate console.\r\n",
+	})
 
 	sessionID := fmt.Sprintf("serial-%d-%d", vmid, time.Now().UnixNano())
 	sess := &ConsoleSession{
@@ -192,6 +217,83 @@ func (s *Server) handleConsoleSerial(w http.ResponseWriter, r *http.Request) {
 		case <-sess.done:
 		}
 	}()
+}
+
+// handleConsoleTest runs diagnostic checks for console connectivity.
+// GET /api/console/test?vmid=123
+func (s *Server) handleConsoleTest(w http.ResponseWriter, r *http.Request) {
+	if s.sshClient == nil {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "error": "Not connected"})
+		return
+	}
+
+	vmidStr := r.URL.Query().Get("vmid")
+	vmid, err := strconv.Atoi(vmidStr)
+	if err != nil || vmid <= 0 {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "error": "Invalid VMID"})
+		return
+	}
+
+	var checks []string
+	addCheck := func(msg string) {
+		checks = append(checks, msg)
+		slog.Info("console test", "vmid", vmid, "check", msg)
+	}
+
+	// 1. Check VM exists and is running
+	result, err := s.sshClient.Run(fmt.Sprintf("qm status %d 2>&1", vmid))
+	if err != nil {
+		addCheck(fmt.Sprintf("FAIL: cannot check VM status: %v", err))
+	} else {
+		addCheck(fmt.Sprintf("VM status: %s", strings.TrimSpace(result.Stdout)))
+	}
+
+	// 2. Check serial0 config
+	result, err = s.sshClient.Run(fmt.Sprintf("qm config %d 2>/dev/null | grep serial", vmid))
+	if err != nil || strings.TrimSpace(result.Stdout) == "" {
+		addCheck("FAIL: no serial device in VM config")
+	} else {
+		addCheck(fmt.Sprintf("Serial config: %s", strings.TrimSpace(result.Stdout)))
+	}
+
+	// 3. Check if serial socket exists
+	socketPath := fmt.Sprintf("/var/run/qemu-server/%d.serial0", vmid)
+	result, err = s.sshClient.Run(fmt.Sprintf("ls -la '%s' 2>&1", socketPath))
+	if err != nil || result.ExitCode != 0 {
+		addCheck(fmt.Sprintf("FAIL: serial socket not found at %s: %s", socketPath, strings.TrimSpace(result.Stdout)))
+	} else {
+		addCheck(fmt.Sprintf("Serial socket: %s", strings.TrimSpace(result.Stdout)))
+	}
+
+	// 4. Check what sockets exist for this VM
+	result, _ = s.sshClient.Run(fmt.Sprintf("ls -la /var/run/qemu-server/%d.* 2>&1", vmid))
+	addCheck(fmt.Sprintf("VM sockets: %s", strings.TrimSpace(result.Stdout)))
+
+	// 5. Check if socat is available
+	result, _ = s.sshClient.Run("command -v socat 2>&1")
+	if result != nil && result.ExitCode == 0 {
+		addCheck(fmt.Sprintf("socat: %s", strings.TrimSpace(result.Stdout)))
+	} else {
+		addCheck("WARN: socat not found")
+	}
+
+	// 6. Check qm terminal availability
+	result, _ = s.sshClient.Run("command -v qm 2>&1")
+	addCheck(fmt.Sprintf("qm: %s", strings.TrimSpace(result.Stdout)))
+
+	// 7. Try a quick qm terminal test (1 second timeout)
+	result, _ = s.sshClient.Run(fmt.Sprintf("timeout 2 qm terminal %d </dev/null 2>&1 || true", vmid))
+	addCheck(fmt.Sprintf("qm terminal test (2s): exit=%d stdout=%q stderr=%q",
+		result.ExitCode, strings.TrimSpace(result.Stdout), strings.TrimSpace(result.Stderr)))
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": true,
+		"vmid":    vmid,
+		"checks":  checks,
+	})
 }
 
 // handleConsoleSessions returns a list of active console sessions.

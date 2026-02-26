@@ -285,6 +285,17 @@ func (c *ISOCollection) FindISOByVersion(component config.ComponentType, version
 	return nil
 }
 
+// SupportsDirectDownload returns true if the ISO can be downloaded directly
+// by Proxmox (i.e. it has an HTTP/HTTPS source URL from an http or dropbox source).
+func SupportsDirectDownload(iso ISOFile) bool {
+	switch iso.SourceType {
+	case "http", "dropbox", "s3":
+		return strings.HasPrefix(iso.SourceURL, "http://") || strings.HasPrefix(iso.SourceURL, "https://")
+	default:
+		return false
+	}
+}
+
 // GetMD5FilePath returns the expected .md5 file path for an ISO
 func GetMD5FilePath(isoPath string) string {
 	return isoPath + ".md5"

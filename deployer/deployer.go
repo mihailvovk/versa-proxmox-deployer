@@ -26,10 +26,20 @@ type Deployer struct {
 	// Rollback tracking
 	createdVMIDs []int
 
+	// ISO storage tracking: maps requested ISO filename → resolved location
+	isoResolvedMap map[string]resolvedISO
+
 	// Progress callbacks
 	OnProgress    func(stage string, current, total int)
 	OnLog         func(message string)
 	OnError       func(err error)
+}
+
+// resolvedISO tracks where an ISO actually lives on Proxmox.
+// Filename may differ from the requested name if matched by MD5.
+type resolvedISO struct {
+	Storage  string // Proxmox storage name
+	Filename string // Actual filename on Proxmox
 }
 
 // DeploymentStage represents a stage of the deployment
@@ -250,23 +260,28 @@ func (d *Deployer) prepareImages() error {
 		}
 	}
 
+	// Get all ISO-capable storages once
+	isoStorages, err := d.discoverer.GetISOStorage()
+	if err != nil || len(isoStorages) == 0 {
+		return fmt.Errorf("no ISO storage available")
+	}
+	// Preferred upload target is the first ISO storage
+	uploadStorName := isoStorages[0].Name
+
+	// Track which storage and filename each ISO resolves to on Proxmox
+	d.isoResolvedMap = make(map[string]resolvedISO)
+
 	// Check/upload each ISO
 	i := 0
 	for isoFile := range isoNeeded {
 		d.progress(StageImagePrep, i, len(isoNeeded))
 		d.log(fmt.Sprintf("Checking ISO: %s", isoFile))
 
-		// Check if ISO exists on Proxmox
-		// First get ISO storage
-		isoStorage, err := d.discoverer.GetISOStorage()
-		if err != nil || len(isoStorage) == 0 {
-			return fmt.Errorf("no ISO storage available")
-		}
-		storName := isoStorage[0].Name
-
-		exists, err := d.storage.ISOExists(storName, isoFile)
-		if err == nil && exists {
-			d.log(fmt.Sprintf("ISO already on Proxmox: %s", isoFile))
+		// 1. Check if ISO already exists by exact filename on any storage
+		foundOn, _ := d.storage.ISOExistsOnAny(isoStorages, isoFile)
+		if foundOn != "" {
+			d.log(fmt.Sprintf("ISO already on Proxmox (%s): %s", foundOn, isoFile))
+			d.isoResolvedMap[isoFile] = resolvedISO{Storage: foundOn, Filename: isoFile}
 			i++
 			continue
 		}
@@ -284,7 +299,55 @@ func (d *Deployer) prepareImages() error {
 			return fmt.Errorf("ISO metadata not found for %s — ensure image sources are configured", isoFile)
 		}
 
-		// Download from source (or use cache)
+		// 2. Check if same content exists under a different filename (MD5 match)
+		if isoMeta.MD5 != "" {
+			d.log(fmt.Sprintf("Checking for existing ISO by MD5 (%s)...", isoMeta.MD5[:8]))
+			stor, existingFile, err := d.storage.FindISOByMD5(isoStorages, isoMeta.MD5)
+			if err == nil {
+				d.log(fmt.Sprintf("Found matching ISO by MD5 on %s: %s (reusing for %s)", stor, existingFile, isoFile))
+				d.isoResolvedMap[isoFile] = resolvedISO{Storage: stor, Filename: existingFile}
+				i++
+				continue
+			}
+		}
+
+		// 3. Try direct download to Proxmox (skips local download + SCP)
+		if sources.SupportsDirectDownload(*isoMeta) {
+			node := d.proxmoxInfo.Nodes[0].Name
+			directOK := false
+
+			// Try 3a: Proxmox native download-url API (pvesh)
+			d.log(fmt.Sprintf("Attempting direct download on Proxmox (pvesh): %s", isoFile))
+			err := d.storage.DownloadISOFromURL(node, uploadStorName, isoFile, isoMeta.SourceURL, d.log)
+			if err == nil {
+				directOK = true
+			} else {
+				d.log(fmt.Sprintf("pvesh download-url failed: %s", err.Error()))
+
+				// Try 3b: wget/curl fallback
+				d.log("Trying wget/curl fallback...")
+				err = d.storage.DownloadISODirect(uploadStorName, isoFile, isoMeta.SourceURL, isoMeta.Size)
+				if err == nil {
+					directOK = true
+				} else {
+					d.log(fmt.Sprintf("Direct download failed, falling back to local download + upload: %s", err.Error()))
+				}
+			}
+
+			// Verify the ISO actually landed on storage before moving on
+			if directOK {
+				found, verifyErr := d.storage.ISOExists(uploadStorName, isoFile)
+				if verifyErr == nil && found {
+					d.log(fmt.Sprintf("Direct download successful: %s", isoFile))
+					d.isoResolvedMap[isoFile] = resolvedISO{Storage: uploadStorName, Filename: isoFile}
+					i++
+					continue
+				}
+				d.log("Direct download reported success but ISO not found on storage, falling back to SCP")
+			}
+		}
+
+		// 4. Fallback: download locally then upload via SCP
 		d.log(fmt.Sprintf("Downloading ISO: %s (source: %s, size: %s)", isoFile, isoMeta.SourceName, formatBytes(isoMeta.Size)))
 		dlResult, err := d.downloader.EnsureISO(*isoMeta, makeThrottledProgress(d, "Download", isoFile))
 		if err != nil {
@@ -298,11 +361,12 @@ func (d *Deployer) prepareImages() error {
 		}
 
 		// Upload to Proxmox via SCP
-		d.log(fmt.Sprintf("Uploading to Proxmox storage '%s': %s (%s)", storName, isoFile, formatBytes(dlResult.Size)))
-		if err := d.storage.UploadISO(dlResult.LocalPath, storName, makeThrottledProgress(d, "Upload", isoFile)); err != nil {
+		d.log(fmt.Sprintf("Uploading to Proxmox storage '%s': %s (%s)", uploadStorName, isoFile, formatBytes(dlResult.Size)))
+		if err := d.storage.UploadISO(dlResult.LocalPath, uploadStorName, makeThrottledProgress(d, "Upload", isoFile)); err != nil {
 			return fmt.Errorf("uploading ISO %s: %w", isoFile, err)
 		}
 		d.log(fmt.Sprintf("Upload complete: %s", isoFile))
+		d.isoResolvedMap[isoFile] = resolvedISO{Storage: uploadStorName, Filename: isoFile}
 
 		i++
 	}
@@ -347,17 +411,28 @@ func (d *Deployer) createVMs() ([]VMResult, error) {
 	var results []VMResult
 	vmIndex := 0
 
-	// Get first ISO storage for reference
-	isoStorage, err := d.discoverer.GetISOStorage()
-	if err != nil || len(isoStorage) == 0 {
-		return nil, fmt.Errorf("no ISO storage available")
-	}
-	isoStorName := isoStorage[0].Name
-
 	for _, comp := range d.config.Components {
 		count := comp.Count
 		if count == 0 {
 			count = 1
+		}
+
+		// Look up the actual storage and filename for this component's ISO
+		isoStorName := ""
+		isoFilename := comp.ISOPath
+		if comp.ISOPath != "" {
+			if resolved, ok := d.isoResolvedMap[comp.ISOPath]; ok {
+				isoStorName = resolved.Storage
+				isoFilename = resolved.Filename
+			}
+		}
+		if isoStorName == "" {
+			// Fallback: pick first ISO-capable storage (most available space)
+			isoStorage, err := d.discoverer.GetISOStorage()
+			if err != nil || len(isoStorage) == 0 {
+				return nil, fmt.Errorf("no ISO storage available")
+			}
+			isoStorName = isoStorage[0].Name
 		}
 
 		for i := 0; i < count; i++ {
@@ -388,6 +463,11 @@ func (d *Deployer) createVMs() ([]VMResult, error) {
 				networks,
 				vmid,
 			)
+
+			// Override ISO filename if resolved to a different name (e.g. MD5 match)
+			if isoFilename != comp.ISOPath {
+				vmConfig.ISOFile = isoFilename
+			}
 
 			// Set target node
 			if comp.Node != "" {

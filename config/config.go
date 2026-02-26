@@ -123,10 +123,10 @@ func (c *Config) AddImageSource(source ImageSource) error {
 	return nil
 }
 
-// RemoveImageSource removes an image source by URL
+// RemoveImageSource removes an image source by URL or name
 func (c *Config) RemoveImageSource(url string) bool {
 	for i, source := range c.ImageSources {
-		if source.URL == url {
+		if source.URL == url || source.Name == url {
 			c.ImageSources = append(c.ImageSources[:i], c.ImageSources[i+1:]...)
 			return true
 		}

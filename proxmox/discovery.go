@@ -3,6 +3,7 @@ package proxmox
 import (
 	"fmt"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -827,7 +828,8 @@ func (d *Discoverer) GetImageCapableStorage() ([]StorageInfo, error) {
 	return imageStorage, nil
 }
 
-// GetISOStorage returns storage that can hold ISO files
+// GetISOStorage returns storage that can hold ISO files, sorted by most
+// available space first so callers can pick the best target by default.
 func (d *Discoverer) GetISOStorage() ([]StorageInfo, error) {
 	storage, err := d.GetStorage()
 	if err != nil {
@@ -846,6 +848,11 @@ func (d *Discoverer) GetISOStorage() ([]StorageInfo, error) {
 			}
 		}
 	}
+
+	// Sort by available space descending — largest first
+	sort.Slice(isoStorage, func(i, j int) bool {
+		return isoStorage[i].AvailableGB > isoStorage[j].AvailableGB
+	})
 
 	return isoStorage, nil
 }

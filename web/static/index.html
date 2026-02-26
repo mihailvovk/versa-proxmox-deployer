@@ -23,7 +23,7 @@
                     <div class="form-row">
                         <div class="form-group">
                             <label for="host">Host</label>
-                            <input type="text" id="host" placeholder="172.16.0.145" required>
+                            <input type="text" id="host" placeholder="192.168.1.100" required>
                         </div>
                         <div class="form-group">
                             <label for="user">User</label>
@@ -165,6 +165,7 @@
                     <div class="form-group">
                         <label for="source-url">URL or Path</label>
                         <input type="text" id="source-url" placeholder="https://dropbox.com/... or sftp://user@host/path or /local/path" required>
+                        <small style="color:#888;margin-top:4px;display:block">Supported: S3 bucket, HTTP directory, Dropbox shared folder, SFTP, local path</small>
                     </div>
                     <div class="form-group">
                         <label for="source-name">Name (optional)</label>

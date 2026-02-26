@@ -48,7 +48,7 @@ func (d *Downloader) EnsureISO(iso sources.ISOFile, progress func(downloaded, to
 	result.LocalPath = cachePath
 
 	// For local sources, the SourceURL is the actual file path.
-	// If it's a symlink pointing to the source, or the file exists with matching size, trust it.
+	// If it's a symlink pointing to the source, or the file exists, trust it.
 	if info, err := os.Lstat(cachePath); err == nil {
 		// If it's a symlink, resolve and check it points to a valid file
 		if info.Mode()&os.ModeSymlink != 0 {
@@ -67,9 +67,11 @@ func (d *Downloader) EnsureISO(iso sources.ISOFile, progress func(downloaded, to
 			// Stale symlink, remove
 			os.Remove(cachePath)
 		} else {
-			// Regular file — check size match
+			// Regular file — if it exists and has a reasonable size, trust the cache.
+			// Source-reported sizes can differ from actual bytes (e.g. Dropbox metadata)
+			// so only re-download if the file is suspiciously small (< 1MB, likely a partial).
 			result.Size = info.Size()
-			if iso.Size > 0 && result.Size == iso.Size {
+			if result.Size > 1024*1024 {
 				result.WasCached = true
 				if iso.MD5 != "" {
 					result.MD5 = iso.MD5
@@ -77,7 +79,8 @@ func (d *Downloader) EnsureISO(iso sources.ISOFile, progress func(downloaded, to
 				}
 				return result, nil
 			}
-			// Size mismatch, re-download
+			// Tiny file, likely a failed partial download — re-download
+			os.Remove(cachePath)
 		}
 	}
 

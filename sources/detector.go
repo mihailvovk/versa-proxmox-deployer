@@ -15,6 +15,7 @@ type SourceType string
 const (
 	SourceTypeDropbox SourceType = "dropbox"
 	SourceTypeHTTP    SourceType = "http"
+	SourceTypeS3     SourceType = "s3"
 	SourceTypeSFTP    SourceType = "sftp"
 	SourceTypeLocal   SourceType = "local"
 )
@@ -26,6 +27,8 @@ func DetectSourceType(url string) SourceType {
 	switch {
 	case strings.Contains(lower, "dropbox.com"):
 		return SourceTypeDropbox
+	case strings.HasPrefix(lower, "s3://") || strings.Contains(lower, ".s3.") || strings.Contains(lower, ".s3-"):
+		return SourceTypeS3
 	case strings.HasPrefix(lower, "sftp://"):
 		return SourceTypeSFTP
 	case strings.HasPrefix(lower, "http://") || strings.HasPrefix(lower, "https://"):
@@ -48,6 +51,12 @@ func CreateSource(src config.ImageSource) (ImageSource, error) {
 	sourceType := SourceType(src.Type)
 	if sourceType == "" {
 		sourceType = DetectSourceType(src.URL)
+	} else {
+		// Re-detect to handle sources saved before newer types (e.g. S3) existed
+		detected := DetectSourceType(src.URL)
+		if detected != sourceType && detected != SourceTypeHTTP {
+			sourceType = detected
+		}
 	}
 
 	name := src.Name
@@ -65,6 +74,9 @@ func CreateSource(src config.ImageSource) (ImageSource, error) {
 
 	case SourceTypeHTTP:
 		return NewHTTPSource(src.URL, name), nil
+
+	case SourceTypeS3:
+		return NewS3Source(src.URL, name)
 
 	case SourceTypeSFTP:
 		sftpSrc, err := NewSFTPSource(src.URL, name)
@@ -128,6 +140,12 @@ func ValidateSourceURL(url string) error {
 	case SourceTypeHTTP:
 		if !strings.HasPrefix(url, "http://") && !strings.HasPrefix(url, "https://") {
 			return fmt.Errorf("invalid HTTP URL: must start with http:// or https://")
+		}
+		return nil
+
+	case SourceTypeS3:
+		if !strings.HasPrefix(url, "s3://") && !strings.Contains(url, ".s3.") && !strings.Contains(url, ".s3-") {
+			return fmt.Errorf("invalid S3 URL: must be s3://bucket/prefix or https://bucket.s3.region.amazonaws.com/prefix/")
 		}
 		return nil
 

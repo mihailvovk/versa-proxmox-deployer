@@ -133,6 +133,7 @@ func (s *Server) Start(httpPort int) error {
 	// Console routes
 	mux.HandleFunc("/api/console/serial", s.handleConsoleSerial)
 	mux.HandleFunc("/api/console/sessions", s.handleConsoleSessions)
+	mux.HandleFunc("/api/console/test", s.handleConsoleTest)
 
 	// Static files
 	staticFS, err := fs.Sub(staticFiles, "static")
@@ -956,16 +957,45 @@ func (s *Server) handleSources(w http.ResponseWriter, r *http.Request) {
 		})
 
 	case "DELETE":
-		// Remove a source by URL
 		var req struct {
-			URL string `json:"url"`
+			URL   string `json:"url"`
+			Index int    `json:"index"`
 		}
+		req.Index = -1
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			json.NewEncoder(w).Encode(SourcesResponse{APIResponse: APIResponse{Error: err.Error()}})
 			return
 		}
 
-		s.cfg.RemoveImageSource(req.URL)
+		removed := false
+		// Try by index, but verify URL matches to prevent wrong deletion
+		if req.Index >= 0 && req.Index < len(s.cfg.ImageSources) {
+			if req.URL == "" || s.cfg.ImageSources[req.Index].URL == req.URL {
+				s.cfg.ImageSources = append(s.cfg.ImageSources[:req.Index], s.cfg.ImageSources[req.Index+1:]...)
+				removed = true
+			}
+		}
+		// Fallback: try by URL string match
+		if !removed && req.URL != "" {
+			removed = s.cfg.RemoveImageSource(req.URL)
+		}
+		// Last resort: try by name
+		if !removed && req.URL != "" {
+			for i, source := range s.cfg.ImageSources {
+				if strings.Contains(source.URL, req.URL) || strings.Contains(req.URL, source.URL) {
+					s.cfg.ImageSources = append(s.cfg.ImageSources[:i], s.cfg.ImageSources[i+1:]...)
+					removed = true
+					break
+				}
+			}
+		}
+		if !removed {
+			json.NewEncoder(w).Encode(SourcesResponse{
+				APIResponse: APIResponse{Success: false, Error: "Source not found"},
+				Sources:     s.cfg.ImageSources,
+			})
+			return
+		}
 		s.cfg.Save()
 
 		// Trigger a rescan in background
