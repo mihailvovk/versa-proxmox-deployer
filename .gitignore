@@ -16,8 +16,8 @@ logs/
 server.crt
 server.key
 
-# Internal docs
-s3bucket.md
+# Documentation (managed outside repo)
+*.md
 
 # OS
 .DS_Store
