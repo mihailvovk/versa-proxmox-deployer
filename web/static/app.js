@@ -238,3 +238,28 @@ function esc(str) {
 function sleep(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
 }
+
+function formatDeployTime(unixSec) {
+    if (!unixSec || unixSec <= 0) return '-';
+    const now = Math.floor(Date.now() / 1000);
+    const diff = now - unixSec;
+    if (diff < 60) return 'just now';
+    if (diff < 3600) return Math.floor(diff / 60) + 'm ago';
+    if (diff < 86400) return Math.floor(diff / 3600) + 'h ago';
+    if (diff < 604800) return Math.floor(diff / 86400) + 'd ago';
+    // Older than a week: show absolute date (YYYY-MM-DD)
+    const d = new Date(unixSec * 1000);
+    const pad = n => n.toString().padStart(2, '0');
+    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+}
+
+function sourceTypeLabel(type) {
+    switch ((type || '').toLowerCase()) {
+        case 'dropbox': return 'Dropbox';
+        case 's3':      return 'S3';
+        case 'http':    return 'HTTP';
+        case 'sftp':    return 'SFTP';
+        case 'local':   return 'Local';
+        default:        return type || '-';
+    }
+}

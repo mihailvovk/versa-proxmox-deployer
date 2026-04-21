@@ -37,7 +37,18 @@ async function loadDeployments() {
             return;
         }
 
-        allVMs.sort((a, b) => a.prefix.localeCompare(b.prefix) || a.VMID - b.VMID);
+        // Sort newest deployment first so the most recent is easy to spot; VMs
+        // within the same deployment stay grouped and ordered by VMID.
+        const tsOf = vm => {
+            const t = (vm.Tags || []).find(x => x.startsWith('versa-ts-'));
+            return t ? parseInt(t.replace('versa-ts-', '')) || 0 : 0;
+        };
+        allVMs.sort((a, b) => {
+            const dt = tsOf(b) - tsOf(a);
+            if (dt !== 0) return dt;
+            const p = a.prefix.localeCompare(b.prefix);
+            return p !== 0 ? p : a.VMID - b.VMID;
+        });
 
         renderDeploymentTable(listEl, allVMs);
     } catch (err) {
@@ -66,6 +77,7 @@ function renderDeploymentTable(container, allVMs) {
             <th>Name</th>
             <th>Deployment</th>
             <th>Component</th>
+            <th>Deployed</th>
             <th>Status</th>
             <th style="width:70px"></th>
         </tr></thead>
@@ -74,17 +86,27 @@ function renderDeploymentTable(container, allVMs) {
     allVMs.forEach(vm => {
         const statusClass = vm.Status === 'running' ? 'running' : 'stopped';
         // Extract component type from tags
-        const compTag = (vm.Tags || []).find(t => t.startsWith('versa-') && t !== 'versa-deployer' && !t.startsWith('versa-deploy-') && !t.startsWith('versa-ha-'));
+        const compTag = (vm.Tags || []).find(t => t.startsWith('versa-')
+            && t !== 'versa-deployer'
+            && !t.startsWith('versa-deploy-')
+            && !t.startsWith('versa-ha-')
+            && !t.startsWith('versa-ts-'));
         const compType = compTag ? compTag.replace('versa-', '') : '';
+
+        const tsTag = (vm.Tags || []).find(t => t.startsWith('versa-ts-'));
+        const deployedAt = tsTag ? parseInt(tsTag.replace('versa-ts-', '')) : 0;
+        const deployedLabel = deployedAt > 0 ? formatDeployTime(deployedAt) : '-';
+        const deployedTitle = deployedAt > 0 ? new Date(deployedAt * 1000).toLocaleString() : '';
 
         const isRunning = (vm.Status || '').toLowerCase() === 'running';
 
-        html += `<tr data-vmid="${vm.VMID}" data-prefix="${esc(vm.prefix)}" data-name="${esc(vm.Name)}">
+        html += `<tr data-vmid="${vm.VMID}" data-prefix="${esc(vm.prefix)}" data-name="${esc(vm.Name)}" data-ts="${deployedAt}">
             <td><input type="checkbox" class="deploy-vm-check" value="${vm.VMID}"></td>
             <td class="deploy-vmid">${vm.VMID}</td>
             <td>${esc(vm.Name)}</td>
             <td><span class="deployment-prefix-tag">${esc(vm.prefix)}</span></td>
             <td>${esc(compType)}</td>
+            <td title="${esc(deployedTitle)}">${esc(deployedLabel)}</td>
             <td><span class="vm-status-badge ${statusClass}">${esc(vm.Status)}</span></td>
             <td>${isRunning ? `<button class="btn-console" onclick="openConsole(${vm.VMID}, '${esc(vm.Name).replace(/'/g, "\\'")}')">Console</button>` : ''}</td>
         </tr>`;

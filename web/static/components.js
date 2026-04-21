@@ -71,7 +71,7 @@ function renderComponentsTable() {
             <td>
                 <select data-idx="${idx}" class="comp-iso">
                     ${hasISOs
-                        ? isos.map((iso, i) => `<option value="${esc(iso.Filename)}" ${i === 0 ? 'selected' : ''}>${esc(iso.Version || iso.Filename)} (${esc(iso.SourceName || '')})</option>`).join('')
+                        ? isos.map((iso, i) => `<option value="${esc(iso.Filename)}" ${i === 0 ? 'selected' : ''}>${esc(iso.Filename)} — ${esc(sourceTypeLabel(iso.SourceType))}</option>`).join('')
                         : '<option value="">Scanning sources...</option>'
                     }
                 </select>

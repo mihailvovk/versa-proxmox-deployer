@@ -3,6 +3,7 @@ package proxmox
 import (
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/mihailvovk/versa-proxmox-deployer/config"
 	"github.com/mihailvovk/versa-proxmox-deployer/ssh"
@@ -208,6 +209,7 @@ func BuildVMConfigForComponent(
 	isoStorage string,
 	networks []VMNetwork,
 	vmid int,
+	deployTime time.Time,
 ) VMConfig {
 	// Build name
 	name := fmt.Sprintf("%s-%s", prefix, comp.Type)
@@ -220,6 +222,7 @@ func BuildVMConfigForComponent(
 		config.TagVersaDeployer,
 		config.GetComponentTag(comp.Type),
 		fmt.Sprintf("versa-deploy-%s", prefix),
+		fmt.Sprintf("versa-ts-%d", deployTime.Unix()),
 	}
 	if comp.Count > 1 {
 		tags = append(tags, fmt.Sprintf("versa-ha-%d", index+1))

@@ -175,7 +175,7 @@ function renderImagesStatus() {
 
     let html = `<div class="images-header"><strong>${images.length} ISOs found</strong></div>`;
     html += '<div class="images-table-wrap">';
-    html += '<table class="images-table"><thead><tr><th>Component</th><th>Version</th><th>Size</th><th>Source</th><th>MD5</th></tr></thead><tbody>';
+    html += '<table class="images-table"><thead><tr><th>Component</th><th>Image</th><th>Version</th><th>Size</th><th>Source</th><th>MD5</th></tr></thead><tbody>';
 
     const compOrder = ['director', 'analytics', 'controller', 'flexvnf', 'concerto', 'router'];
     const sortedKeys = Object.keys(grouped).sort((a, b) => {
@@ -189,13 +189,15 @@ function renderImagesStatus() {
         isos.forEach((iso, i) => {
             const size = iso.Size > 0 ? formatSize(iso.Size) : '-';
             const md5 = iso.HasMD5File ? '<span class="tag-yes">yes</span>' : '<span class="tag-no">no</span>';
+            const srcLabel = sourceTypeLabel(iso.SourceType);
             html += `<tr>`;
             html += i === 0
                 ? `<td class="iso-comp-cell" rowspan="${isos.length}">${esc(name)} <span class="iso-comp-count">(${isos.length})</span></td>`
                 : '';
-            html += `<td>${esc(iso.Version || iso.Filename)}</td>`;
+            html += `<td title="${esc(iso.SourceURL || iso.Filename)}">${esc(iso.Filename)}</td>`;
+            html += `<td>${esc(iso.Version || '-')}</td>`;
             html += `<td>${size}</td>`;
-            html += `<td>${esc(iso.SourceName || '-')}</td>`;
+            html += `<td>${esc(srcLabel)}</td>`;
             html += `<td>${md5}</td>`;
             html += `</tr>`;
         });

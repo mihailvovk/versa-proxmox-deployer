@@ -29,6 +29,9 @@ type Deployer struct {
 	// ISO storage tracking: maps requested ISO filename → resolved location
 	isoResolvedMap map[string]resolvedISO
 
+	// Deployment timestamp (set at start of Deploy, tagged on each VM)
+	deployTime time.Time
+
 	// Progress callbacks
 	OnProgress    func(stage string, current, total int)
 	OnLog         func(message string)
@@ -181,6 +184,7 @@ func (d *Deployer) Validate() error {
 // Deploy executes the full deployment
 func (d *Deployer) Deploy() (*DeploymentResult, error) {
 	startTime := time.Now()
+	d.deployTime = startTime
 	result := &DeploymentResult{
 		ConsoleURLs: make(map[string]string),
 	}
@@ -462,6 +466,7 @@ func (d *Deployer) createVMs() ([]VMResult, error) {
 				isoStorName,
 				networks,
 				vmid,
+				d.deployTime,
 			)
 
 			// Override ISO filename if resolved to a different name (e.g. MD5 match)
