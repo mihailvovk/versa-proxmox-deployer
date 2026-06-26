@@ -47,21 +47,31 @@ func NewClient(opts ClientOptions) (*Client, error) {
 		opts.Timeout = 30 * time.Second
 	}
 
-	// Build authentication methods
+	// Build authentication methods, mirroring how the `ssh` command behaves:
+	// an explicit key, else the user's default key, then password — offered both
+	// as the plain "password" method and keyboard-interactive (many PAM/sshd
+	// setups accept a password only via keyboard-interactive).
 	var authMethods []ssh.AuthMethod
 
-	// Try key-based auth first if key path provided
 	if opts.KeyPath != "" {
 		keyAuth, err := KeyAuth(opts.KeyPath, opts.KeyPassphrase)
 		if err != nil {
 			return nil, fmt.Errorf("loading SSH key: %w", err)
 		}
 		authMethods = append(authMethods, keyAuth)
+	} else if defaultKey := FindDefaultKey(); defaultKey != "" {
+		// Fall back to the user's default SSH key (skip silently if it's
+		// passphrase-protected, since we can't prompt for it here).
+		if keyAuth, err := KeyAuth(defaultKey, ""); err == nil {
+			authMethods = append(authMethods, keyAuth)
+		}
 	}
 
-	// Add password auth if provided
 	if opts.Password != "" {
-		authMethods = append(authMethods, ssh.Password(opts.Password))
+		authMethods = append(authMethods,
+			ssh.Password(opts.Password),
+			KeyboardInteractiveAuth(opts.Password),
+		)
 	}
 
 	if len(authMethods) == 0 {
