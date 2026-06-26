@@ -169,9 +169,13 @@ func (c *Client) startKeepalive() {
 				// SendRequest with wantReply=true acts as a ping
 				_, _, err := client.SendRequest("keepalive@openssh.com", true, nil)
 				if err != nil {
-					// Connection is dead — mark as nil so next command auto-reconnects
+					// Connection is dead — mark as nil so next command auto-reconnects.
+					// Only clear it if it's still the client we were pinging; another
+					// goroutine may have already reconnected and replaced it.
 					c.mu.Lock()
-					c.client = nil
+					if c.client == client {
+						c.client = nil
+					}
 					c.mu.Unlock()
 					return
 				}
