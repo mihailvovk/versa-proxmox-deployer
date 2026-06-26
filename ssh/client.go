@@ -47,21 +47,31 @@ func NewClient(opts ClientOptions) (*Client, error) {
 		opts.Timeout = 30 * time.Second
 	}
 
-	// Build authentication methods
+	// Build authentication methods, mirroring how the `ssh` command behaves:
+	// an explicit key, else the user's default key, then password — offered both
+	// as the plain "password" method and keyboard-interactive (many PAM/sshd
+	// setups accept a password only via keyboard-interactive).
 	var authMethods []ssh.AuthMethod
 
-	// Try key-based auth first if key path provided
 	if opts.KeyPath != "" {
 		keyAuth, err := KeyAuth(opts.KeyPath, opts.KeyPassphrase)
 		if err != nil {
 			return nil, fmt.Errorf("loading SSH key: %w", err)
 		}
 		authMethods = append(authMethods, keyAuth)
+	} else if defaultKey := FindDefaultKey(); defaultKey != "" {
+		// Fall back to the user's default SSH key (skip silently if it's
+		// passphrase-protected, since we can't prompt for it here).
+		if keyAuth, err := KeyAuth(defaultKey, ""); err == nil {
+			authMethods = append(authMethods, keyAuth)
+		}
 	}
 
-	// Add password auth if provided
 	if opts.Password != "" {
-		authMethods = append(authMethods, ssh.Password(opts.Password))
+		authMethods = append(authMethods,
+			ssh.Password(opts.Password),
+			KeyboardInteractiveAuth(opts.Password),
+		)
 	}
 
 	if len(authMethods) == 0 {
@@ -98,17 +108,27 @@ func NewClient(opts ClientOptions) (*Client, error) {
 // Connect establishes the SSH connection and starts keepalive
 func (c *Client) Connect() error {
 	c.mu.Lock()
-	defer c.mu.Unlock()
-
 	if c.client != nil {
+		c.mu.Unlock()
 		return nil // Already connected
 	}
+	c.mu.Unlock()
 
+	// Dial outside the lock — dialSSH does up to ~30s of network I/O, and holding
+	// c.mu across it would stall IsConnected/Close/keepalive/status polls.
 	client, err := c.dialSSH()
 	if err != nil {
 		return err
 	}
 
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.client != nil {
+		// Another goroutine connected while we were dialing — keep theirs and
+		// close our redundant connection so it doesn't leak.
+		client.Close()
+		return nil
+	}
 	c.client = client
 	c.startKeepalive()
 	return nil
@@ -159,9 +179,13 @@ func (c *Client) startKeepalive() {
 				// SendRequest with wantReply=true acts as a ping
 				_, _, err := client.SendRequest("keepalive@openssh.com", true, nil)
 				if err != nil {
-					// Connection is dead — mark as nil so next command auto-reconnects
+					// Connection is dead — mark as nil so next command auto-reconnects.
+					// Only clear it if it's still the client we were pinging; another
+					// goroutine may have already reconnected and replaced it.
 					c.mu.Lock()
-					c.client = nil
+					if c.client == client {
+						c.client = nil
+					}
 					c.mu.Unlock()
 					return
 				}
@@ -229,6 +253,14 @@ func (c *Client) getClient() (*ssh.Client, error) {
 	}
 
 	c.mu.Lock()
+	if c.client != nil {
+		// Another goroutine connected while we were dialing — keep theirs and
+		// close our redundant connection so it doesn't leak.
+		existing := c.client
+		c.mu.Unlock()
+		client.Close()
+		return existing, nil
+	}
 	c.client = client
 	c.startKeepalive()
 	c.mu.Unlock()
@@ -245,9 +277,18 @@ func (c *Client) newSession() (*ssh.Session, error) {
 
 	session, err := client.NewSession()
 	if err != nil {
-		// Connection might be stale, try reconnecting
+		// Connection might be stale. Only invalidate it if it's still the client
+		// we used (another goroutine may have already reconnected), and close the
+		// stale connection so it doesn't leak.
 		c.mu.Lock()
-		c.client = nil
+		if c.client == client {
+			c.client = nil
+			if c.stopKeep != nil {
+				close(c.stopKeep)
+				c.stopKeep = nil
+			}
+			go client.Close()
+		}
 		c.mu.Unlock()
 
 		client, err = c.getClient()
@@ -282,6 +323,13 @@ func knownHostsPath() string {
 // On first connection to a host, the key is accepted and written to the known_hosts file.
 // On subsequent connections, the key is verified against the stored key.
 // If the key has changed, an error is returned warning about a possible MITM attack.
+// TOFUHostKeyCallback exposes the shared Trust-On-First-Use known_hosts callback
+// so other packages (e.g. SFTP image sources) can verify host keys against the
+// same ~/.versa-deployer/known_hosts file instead of disabling verification.
+func TOFUHostKeyCallback() (ssh.HostKeyCallback, error) {
+	return tofuHostKeyCallback()
+}
+
 func tofuHostKeyCallback() (ssh.HostKeyCallback, error) {
 	khPath := knownHostsPath()
 

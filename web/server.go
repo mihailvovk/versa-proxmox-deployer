@@ -35,8 +35,13 @@ type Server struct {
 	cfg       *config.Config
 	httpsPort int
 
+	// Connection state — guarded by connMu (swapped on every /api/connect).
+	connMu     sync.RWMutex
 	sshClient  *ssh.Client
 	discoverer *proxmox.Discoverer
+
+	// cfgMu guards all read-modify-Save sequences on cfg.
+	cfgMu sync.Mutex
 
 	// Cached discovery results
 	mu             sync.RWMutex
@@ -77,6 +82,7 @@ type DiscoveryState struct {
 	VMs         []proxmox.VMInfo      `json:"vms"`
 	Images      []sources.ISOFile     `json:"images"`
 	Error       string                `json:"error,omitempty"`
+	Warnings    []string              `json:"warnings,omitempty"`
 }
 
 // NewServer creates a new web server
@@ -86,6 +92,44 @@ func NewServer(cfg *config.Config, httpsPort int) *Server {
 		httpsPort:  httpsPort,
 		sseClients: make(map[chan string]struct{}),
 	}
+}
+
+// getClient returns the current SSH client (may be nil). Callers should snapshot
+// once and nil-check, rather than reading s.sshClient directly.
+func (s *Server) getClient() *ssh.Client {
+	s.connMu.RLock()
+	defer s.connMu.RUnlock()
+	return s.sshClient
+}
+
+// getDiscoverer returns the current discoverer (may be nil).
+func (s *Server) getDiscoverer() *proxmox.Discoverer {
+	s.connMu.RLock()
+	defer s.connMu.RUnlock()
+	return s.discoverer
+}
+
+// setConnection atomically swaps in a new client/discoverer and closes the
+// previous client (outside the lock) so in-flight readers aren't disrupted mid-op.
+func (s *Server) setConnection(client *ssh.Client, disc *proxmox.Discoverer) {
+	s.connMu.Lock()
+	old := s.sshClient
+	s.sshClient = client
+	s.discoverer = disc
+	s.connMu.Unlock()
+	if old != nil && old != client {
+		go old.Close()
+	}
+}
+
+// snapshotSources returns a copy of the configured image sources taken under
+// cfgMu. Background scans, deploys, and GET handlers must build sources from
+// this snapshot (never the live s.cfg.ImageSources slice) so a concurrent
+// add/remove can't tear the slice header into a ptr/len mismatch.
+func (s *Server) snapshotSources() []config.ImageSource {
+	s.cfgMu.Lock()
+	defer s.cfgMu.Unlock()
+	return append([]config.ImageSource(nil), s.cfg.ImageSources...)
 }
 
 // getOutboundIP returns the preferred outbound IP of this machine
@@ -203,33 +247,48 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 			LastProxmoxUser: s.cfg.LastProxmoxUser,
 			LastStorage:     s.cfg.LastStorage,
 			LastSSHKeyPath:  s.cfg.LastSSHKeyPath,
-			ImageSources:    s.cfg.ImageSources,
+			ImageSources:    sanitizeSources(s.cfg.ImageSources),
 			HasPassword:     s.cfg.LastProxmoxPassword != "",
 		})
 
 	case "POST":
-		var updates map[string]interface{}
-		if err := json.NewDecoder(r.Body).Decode(&updates); err != nil {
+		// Pointer fields preserve partial-update semantics (nil = field absent =
+		// leave unchanged); DisallowUnknownFields rejects typos instead of
+		// silently dropping them.
+		var upd struct {
+			LastProxmoxHost     *string `json:"lastProxmoxHost"`
+			LastProxmoxUser     *string `json:"lastProxmoxUser"`
+			LastProxmoxPassword *string `json:"lastProxmoxPassword"`
+			LastStorage         *string `json:"lastStorage"`
+			LastSSHKeyPath      *string `json:"lastSSHKeyPath"`
+		}
+		dec := json.NewDecoder(r.Body)
+		dec.DisallowUnknownFields()
+		if err := dec.Decode(&upd); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		if v, ok := updates["lastProxmoxHost"].(string); ok {
-			s.cfg.LastProxmoxHost = v
+
+		s.cfgMu.Lock()
+		if upd.LastProxmoxHost != nil {
+			s.cfg.LastProxmoxHost = *upd.LastProxmoxHost
 		}
-		if v, ok := updates["lastProxmoxUser"].(string); ok {
-			s.cfg.LastProxmoxUser = v
+		if upd.LastProxmoxUser != nil {
+			s.cfg.LastProxmoxUser = *upd.LastProxmoxUser
 		}
-		if v, ok := updates["lastProxmoxPassword"].(string); ok {
-			s.cfg.LastProxmoxPassword = v
+		if upd.LastProxmoxPassword != nil {
+			s.cfg.LastProxmoxPassword = *upd.LastProxmoxPassword
 		}
-		if v, ok := updates["lastStorage"].(string); ok {
-			s.cfg.LastStorage = v
+		if upd.LastStorage != nil {
+			s.cfg.LastStorage = *upd.LastStorage
 		}
-		if v, ok := updates["lastSSHKeyPath"].(string); ok {
-			s.cfg.LastSSHKeyPath = v
+		if upd.LastSSHKeyPath != nil {
+			s.cfg.LastSSHKeyPath = *upd.LastSSHKeyPath
 		}
-		if err := s.cfg.Save(); err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+		saveErr := s.cfg.Save()
+		s.cfgMu.Unlock()
+		if saveErr != nil {
+			http.Error(w, saveErr.Error(), http.StatusInternalServerError)
 			return
 		}
 		json.NewEncoder(w).Encode(APIResponse{Success: true})
@@ -245,10 +304,11 @@ func (s *Server) handleConnectionStatus(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	connected := s.sshClient != nil && s.sshClient.IsConnected()
+	client := s.getClient()
+	connected := client != nil && client.IsConnected()
 	host := ""
-	if s.sshClient != nil {
-		host = s.sshClient.Host()
+	if client != nil {
+		host = client.Host()
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -280,6 +340,26 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 		req.User = "root"
 	}
 
+	// Refuse to reconnect while a deploy is running: setConnection closes the old
+	// SSH client, and the in-flight deployer captured that exact pointer — swapping
+	// it out mid-deploy kills every subsequent qm/pvesm/scp and triggers a rollback
+	// over a dead connection.
+	s.deployMu.RLock()
+	deployActive := s.deployStatus != nil && s.deployStatus.Active
+	s.deployMu.RUnlock()
+	if deployActive {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusConflict)
+		json.NewEncoder(w).Encode(APIResponse{Error: "A deployment is in progress; cannot reconnect"})
+		return
+	}
+
+	// Snapshot saved credentials under cfgMu (a concurrent config save mutates them).
+	s.cfgMu.Lock()
+	savedKeyPath := s.cfg.LastSSHKeyPath
+	savedPassword := s.cfg.LastProxmoxPassword
+	s.cfgMu.Unlock()
+
 	// Build SSH client options
 	opts := ssh.ClientOptions{
 		Host:         req.Host,
@@ -289,14 +369,14 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.SSHKeyPath != "" {
 		opts.KeyPath = req.SSHKeyPath
-	} else if s.cfg.LastSSHKeyPath != "" {
-		opts.KeyPath = s.cfg.LastSSHKeyPath
+	} else if savedKeyPath != "" {
+		opts.KeyPath = savedKeyPath
 	}
 	if req.Password != "" {
 		opts.Password = req.Password
-	} else if s.cfg.LastProxmoxPassword != "" {
+	} else if savedPassword != "" {
 		// Use saved password when user leaves the field empty
-		opts.Password = s.cfg.LastProxmoxPassword
+		opts.Password = savedPassword
 	}
 
 	client, err := ssh.NewClient(opts)
@@ -318,7 +398,8 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Save connection info
+	// Save connection info (SSH I/O is already done; only touch cfg under the lock)
+	s.cfgMu.Lock()
 	s.cfg.LastProxmoxHost = req.Host
 	s.cfg.LastProxmoxUser = req.User
 	if req.SavePassword && req.Password != "" {
@@ -328,14 +409,10 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 		s.cfg.LastSSHKeyPath = req.SSHKeyPath
 	}
 	s.cfg.Save()
+	s.cfgMu.Unlock()
 
-	// Close any previous connection
-	if s.sshClient != nil {
-		s.sshClient.Close()
-	}
-
-	s.sshClient = client
-	s.discoverer = proxmox.NewDiscoverer(client)
+	// Swap in the new connection (closes the previous client safely)
+	s.setConnection(client, proxmox.NewDiscoverer(client))
 
 	// Run parallel discovery in background
 	go s.runParallelDiscovery()
@@ -347,7 +424,16 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 func (s *Server) runParallelDiscovery() {
 	state := &DiscoveryState{Connected: true}
 
-	info, err := s.discoverer.DiscoverParallel()
+	disc := s.getDiscoverer()
+	if disc == nil {
+		state.Error = "not connected"
+		s.mu.Lock()
+		s.discoveryState = state
+		s.mu.Unlock()
+		return
+	}
+
+	info, err := disc.DiscoverParallel()
 	if err != nil {
 		state.Error = err.Error()
 		s.mu.Lock()
@@ -364,13 +450,18 @@ func (s *Server) runParallelDiscovery() {
 	state.Networks = info.Networks
 	state.VMs = info.ExistingVMs
 
+	// Surface partial-discovery failures as warnings (data still renders).
+	for section, msg := range info.SectionErrors {
+		state.Warnings = append(state.Warnings, fmt.Sprintf("%s discovery failed: %s", section, msg))
+	}
+
 	s.mu.Lock()
 	s.discoveryState = state
 	s.mu.Unlock()
 
 	// Scan image sources in background (can be slow)
 	go func() {
-		imageSources, err := sources.CreateSourcesFromConfig(s.cfg)
+		imageSources, err := sources.CreateSourcesFromConfig(s.snapshotSources())
 		if err != nil {
 			return
 		}
@@ -415,7 +506,7 @@ func (s *Server) handleDiscovery(w http.ResponseWriter, r *http.Request) {
 // ensureBridgesExist checks all bridges referenced in the network config and creates
 // any that don't exist on Proxmox. Writes directly to /etc/network/interfaces and
 // brings bridges up with ifup. Verifies each step.
-func (s *Server) ensureBridgesExist(networks config.NetworkConfig) error {
+func (s *Server) ensureBridgesExist(client *ssh.Client, networks config.NetworkConfig) error {
 	// Collect all unique bridge names from the config
 	bridges := make(map[string]bool)
 	for _, b := range []string{
@@ -447,7 +538,7 @@ func (s *Server) ensureBridgesExist(networks config.NetworkConfig) error {
 
 	// Check which bridges actually exist on the live system
 	existing := make(map[string]bool)
-	result, err := s.sshClient.Run("ls /sys/class/net/")
+	result, err := client.Run("ls /sys/class/net/")
 	if err != nil {
 		return fmt.Errorf("listing network interfaces: %w", err)
 	}
@@ -457,7 +548,7 @@ func (s *Server) ensureBridgesExist(networks config.NetworkConfig) error {
 
 	// Also check what's already defined in /etc/network/interfaces
 	defined := make(map[string]bool)
-	ifResult, _ := s.sshClient.Run("grep -oP '(?<=^iface )vmbr\\d+' /etc/network/interfaces")
+	ifResult, _ := client.Run("grep -oP '(?<=^iface )vmbr\\d+' /etc/network/interfaces")
 	if ifResult != nil {
 		for _, name := range strings.Fields(ifResult.Stdout) {
 			defined[strings.TrimSpace(name)] = true
@@ -493,7 +584,7 @@ func (s *Server) ensureBridgesExist(networks config.NetworkConfig) error {
 			`printf '\nauto %s\niface %s inet manual\n\tbridge-ports none\n\tbridge-stp off\n\tbridge-fd 0\n' >> /etc/network/interfaces`,
 			bridge, bridge,
 		)
-		r, err := s.sshClient.Run(appendCmd)
+		r, err := client.Run(appendCmd)
 		if err != nil {
 			return fmt.Errorf("writing bridge %s to interfaces file: %w", bridge, err)
 		}
@@ -505,14 +596,14 @@ func (s *Server) ensureBridgesExist(networks config.NetworkConfig) error {
 	// Bring up each missing bridge
 	for _, bridge := range missing {
 		slog.Info("bringing up bridge", "bridge", bridge)
-		r, err := s.sshClient.Run(fmt.Sprintf("ifup %s", bridge))
+		r, err := client.Run(fmt.Sprintf("ifup %s", bridge))
 		if err != nil {
 			return fmt.Errorf("ifup %s: %w", bridge, err)
 		}
 		if r.ExitCode != 0 {
 			// Try ifreload as fallback
 			slog.Warn("ifup failed, trying ifreload", "bridge", bridge)
-			r2, _ := s.sshClient.Run("ifreload -a")
+			r2, _ := client.Run("ifreload -a")
 			if r2 != nil && r2.ExitCode != 0 {
 				return fmt.Errorf("bringing up bridge %s failed — ifup exit %d: %s, ifreload exit %d: %s",
 					bridge, r.ExitCode, r.Stderr, r2.ExitCode, r2.Stderr)
@@ -521,7 +612,7 @@ func (s *Server) ensureBridgesExist(networks config.NetworkConfig) error {
 	}
 
 	// Verify every bridge now exists on the live system
-	r, err := s.sshClient.Run("ls /sys/class/net/")
+	r, err := client.Run("ls /sys/class/net/")
 	if err != nil {
 		return fmt.Errorf("verifying bridges: %w", err)
 	}
@@ -560,16 +651,41 @@ func (s *Server) handleDeploy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if s.sshClient == nil {
+	client := s.getClient()
+	if client == nil {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(APIResponse{Error: "Not connected to Proxmox"})
 		return
 	}
 
-	// Auto-create any bridges that don't exist on Proxmox
-	if err := s.ensureBridgesExist(req.Networks); err != nil {
+	// Reject overlapping deployments — two concurrent deploys would clobber the
+	// shared deploy status and race VMID/bridge allocation over the same client.
+	s.deployMu.Lock()
+	if s.deployStatus != nil && s.deployStatus.Active {
+		s.deployMu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(APIResponse{Error: fmt.Sprintf("Failed to create bridges: %v", err)})
+		w.WriteHeader(http.StatusConflict)
+		json.NewEncoder(w).Encode(APIResponse{Error: "A deployment is already in progress"})
+		return
+	}
+	s.deployStatus = &DeployStatus{Active: true, Stage: "initializing"}
+	s.deployMu.Unlock()
+
+	// Helper to abort the synchronous setup paths without leaving Active stuck.
+	failDeploy := func(msg string) {
+		s.deployMu.Lock()
+		if s.deployStatus != nil {
+			s.deployStatus.Active = false
+			s.deployStatus.Error = msg
+		}
+		s.deployMu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(APIResponse{Error: msg})
+	}
+
+	// Auto-create any bridges that don't exist on Proxmox
+	if err := s.ensureBridgesExist(client, req.Networks); err != nil {
+		failDeploy(fmt.Sprintf("Failed to create bridges: %v", err))
 		return
 	}
 
@@ -582,9 +698,9 @@ func (s *Server) handleDeploy(w http.ResponseWriter, r *http.Request) {
 	deployCfg.Networks = req.Networks
 	deployCfg.Components = req.Components
 
-	imageSources, _ := sources.CreateSourcesFromConfig(s.cfg)
+	imageSources, _ := sources.CreateSourcesFromConfig(s.snapshotSources())
 
-	dep := deployer.NewDeployer(s.sshClient, imageSources)
+	dep := deployer.NewDeployer(client, imageSources)
 	dep.SetConfig(deployCfg)
 
 	// Pass scanned images so deployer can download from sources
@@ -593,11 +709,6 @@ func (s *Server) handleDeploy(w http.ResponseWriter, r *http.Request) {
 		dep.SetKnownImages(s.discoveryState.Images)
 	}
 	s.mu.Unlock()
-
-	// Init deploy status tracking
-	s.deployMu.Lock()
-	s.deployStatus = &DeployStatus{Active: true, Stage: "initializing"}
-	s.deployMu.Unlock()
 
 	// Create deploy log file
 	logDir := filepath.Join(config.ConfigDir(), "logs")
@@ -687,8 +798,10 @@ func (s *Server) handleDeploy(w http.ResponseWriter, r *http.Request) {
 
 		for _, vm := range result.VMs {
 			if vm.Component == config.ComponentDirector && vm.IP != "" {
+				s.cfgMu.Lock()
 				s.cfg.DirectorIP = vm.IP
 				s.cfg.Save()
+				s.cfgMu.Unlock()
 				break
 			}
 		}
@@ -795,7 +908,8 @@ func (s *Server) handleCreateNetwork(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if s.sshClient == nil {
+	client := s.getClient()
+	if client == nil {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(APIResponse{Error: "Not connected to Proxmox"})
 		return
@@ -815,7 +929,7 @@ func (s *Server) handleCreateNetwork(w http.ResponseWriter, r *http.Request) {
 		cmd += " -gateway " + ssh.ShellEscape(req.Gateway)
 	}
 
-	result, err := s.sshClient.Run(cmd)
+	result, err := client.Run(cmd)
 	if err != nil || result.ExitCode != 0 {
 		errMsg := "command failed"
 		if err != nil {
@@ -829,8 +943,20 @@ func (s *Server) handleCreateNetwork(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Apply network changes
-	s.sshClient.Run("pvesh set /nodes/" + ssh.ShellEscape(req.Node) + "/network")
+	// Apply network changes — check the result instead of assuming success.
+	applyRes, applyErr := client.Run("pvesh set /nodes/" + ssh.ShellEscape(req.Node) + "/network")
+	if applyErr != nil || (applyRes != nil && applyRes.ExitCode != 0) {
+		errMsg := "network created but applying changes failed"
+		if applyErr != nil {
+			errMsg += ": " + applyErr.Error()
+		}
+		if applyRes != nil && applyRes.Stderr != "" {
+			errMsg += ": " + applyRes.Stderr
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(APIResponse{Error: errMsg})
+		return
+	}
 
 	go s.runParallelDiscovery()
 
@@ -844,7 +970,7 @@ func (s *Server) handleScanSources(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	imageSources, err := sources.CreateSourcesFromConfig(s.cfg)
+	imageSources, err := sources.CreateSourcesFromConfig(s.snapshotSources())
 	if err != nil {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(ScanSourcesResponse{APIResponse: APIResponse{Error: err.Error()}})
@@ -886,7 +1012,7 @@ func (s *Server) handleSources(w http.ResponseWriter, r *http.Request) {
 		// Return configured sources
 		json.NewEncoder(w).Encode(SourcesResponse{
 			APIResponse: APIResponse{Success: true},
-			Sources:     s.cfg.ImageSources,
+			Sources:     sanitizeSources(s.cfg.ImageSources),
 		})
 
 	case "POST":
@@ -941,19 +1067,22 @@ func (s *Server) handleSources(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		s.cfgMu.Lock()
 		if err := s.cfg.AddImageSource(newSource); err != nil {
+			s.cfgMu.Unlock()
 			json.NewEncoder(w).Encode(SourcesResponse{APIResponse: APIResponse{Error: err.Error()}})
 			return
 		}
-
 		s.cfg.Save()
+		srcsDTO := sanitizeSources(s.cfg.ImageSources)
+		s.cfgMu.Unlock()
 
 		// Trigger a rescan in background
 		go s.scanAndUpdateImages()
 
 		json.NewEncoder(w).Encode(SourcesResponse{
 			APIResponse: APIResponse{Success: true},
-			Sources:     s.cfg.ImageSources,
+			Sources:     srcsDTO,
 		})
 
 	case "DELETE":
@@ -967,6 +1096,7 @@ func (s *Server) handleSources(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		s.cfgMu.Lock()
 		removed := false
 		// Try by index, but verify URL matches to prevent wrong deletion
 		if req.Index >= 0 && req.Index < len(s.cfg.ImageSources) {
@@ -990,20 +1120,24 @@ func (s *Server) handleSources(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		if !removed {
+			srcsDTO := sanitizeSources(s.cfg.ImageSources)
+			s.cfgMu.Unlock()
 			json.NewEncoder(w).Encode(SourcesResponse{
 				APIResponse: APIResponse{Success: false, Error: "Source not found"},
-				Sources:     s.cfg.ImageSources,
+				Sources:     srcsDTO,
 			})
 			return
 		}
 		s.cfg.Save()
+		srcsDTO := sanitizeSources(s.cfg.ImageSources)
+		s.cfgMu.Unlock()
 
 		// Trigger a rescan in background
 		go s.scanAndUpdateImages()
 
 		json.NewEncoder(w).Encode(SourcesResponse{
 			APIResponse: APIResponse{Success: true},
-			Sources:     s.cfg.ImageSources,
+			Sources:     srcsDTO,
 		})
 
 	default:
@@ -1013,7 +1147,7 @@ func (s *Server) handleSources(w http.ResponseWriter, r *http.Request) {
 
 // scanAndUpdateImages scans all configured sources and updates discovery state
 func (s *Server) scanAndUpdateImages() {
-	imageSources, err := sources.CreateSourcesFromConfig(s.cfg)
+	imageSources, err := sources.CreateSourcesFromConfig(s.snapshotSources())
 	if err != nil {
 		return
 	}
@@ -1047,7 +1181,9 @@ func (s *Server) handleUploadKey(w http.ResponseWriter, r *http.Request) {
 	// Limit upload to 64KB (SSH keys are small)
 	r.Body = http.MaxBytesReader(w, r.Body, 64*1024)
 
-	file, header, err := r.FormFile("key")
+	// Ignore the client-supplied filename entirely (it's a path-traversal vector)
+	// and always write to a single fixed path under the config dir.
+	file, _, err := r.FormFile("key")
 	if err != nil {
 		json.NewEncoder(w).Encode(UploadKeyResponse{APIResponse: APIResponse{Error: fmt.Sprintf("Failed to read uploaded file: %v", err)}})
 		return
@@ -1060,22 +1196,19 @@ func (s *Server) handleUploadKey(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Save to ~/.versa-deployer/ssh_key (or use original filename)
-	keyDir := config.ConfigDir()
-	keyName := header.Filename
-	if keyName == "" {
-		keyName = "ssh_key"
-	}
-	keyPath := filepath.Join(keyDir, keyName)
+	const keyName = "uploaded_ssh_key"
+	keyPath := filepath.Join(config.ConfigDir(), keyName)
 
 	if err := os.WriteFile(keyPath, keyData, 0600); err != nil {
 		json.NewEncoder(w).Encode(UploadKeyResponse{APIResponse: APIResponse{Error: fmt.Sprintf("Failed to save key: %v", err)}})
 		return
 	}
 
-	// Save path in config
+	// Adopt the uploaded key for the next connect (UI is local/trusted).
+	s.cfgMu.Lock()
 	s.cfg.LastSSHKeyPath = keyPath
 	s.cfg.Save()
+	s.cfgMu.Unlock()
 
 	json.NewEncoder(w).Encode(UploadKeyResponse{
 		APIResponse: APIResponse{Success: true},
@@ -1098,12 +1231,13 @@ func (s *Server) handleDeployments(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 
-	if s.sshClient == nil || s.discoverer == nil {
+	disc := s.getDiscoverer()
+	if s.getClient() == nil || disc == nil {
 		json.NewEncoder(w).Encode(DeploymentsResponse{APIResponse: APIResponse{Error: "Not connected to Proxmox"}})
 		return
 	}
 
-	versaVMs, err := s.discoverer.FindVersaDeployments()
+	versaVMs, err := disc.FindVersaDeployments()
 	if err != nil {
 		json.NewEncoder(w).Encode(DeploymentsResponse{APIResponse: APIResponse{Error: fmt.Sprintf("Failed to find deployments: %v", err)}})
 		return
@@ -1171,13 +1305,15 @@ func (s *Server) handleDeploymentsStop(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if s.sshClient == nil || s.discoverer == nil {
+	client := s.getClient()
+	disc := s.getDiscoverer()
+	if client == nil || disc == nil {
 		json.NewEncoder(w).Encode(VMActionResponse{APIResponse: APIResponse{Error: "Not connected to Proxmox"}})
 		return
 	}
 
 	// Safety: verify all VMIDs have the versa-deployer tag
-	versaVMs, err := s.discoverer.FindVersaDeployments()
+	versaVMs, err := disc.FindVersaDeployments()
 	if err != nil {
 		json.NewEncoder(w).Encode(VMActionResponse{APIResponse: APIResponse{Error: fmt.Sprintf("Failed to verify VMs: %v", err)}})
 		return
@@ -1195,9 +1331,10 @@ func (s *Server) handleDeploymentsStop(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	vmCreator := proxmox.NewVMCreator(s.sshClient)
+	vmCreator := proxmox.NewVMCreator(client)
 	results := make([]VMActionResult, 0, len(req.VMIDs))
 
+	anyFail := false
 	for _, vmid := range req.VMIDs {
 		vm := versaLookup[vmid]
 		entry := VMActionResult{
@@ -1207,6 +1344,7 @@ func (s *Server) handleDeploymentsStop(w http.ResponseWriter, r *http.Request) {
 
 		if err := vmCreator.StopVM(vmid); err != nil {
 			entry.Error = err.Error()
+			anyFail = true
 		} else {
 			entry.Success = true
 		}
@@ -1214,7 +1352,7 @@ func (s *Server) handleDeploymentsStop(w http.ResponseWriter, r *http.Request) {
 	}
 
 	json.NewEncoder(w).Encode(VMActionResponse{
-		APIResponse: APIResponse{Success: true},
+		APIResponse: APIResponse{Success: !anyFail},
 		Results:     results,
 	})
 }
@@ -1236,7 +1374,9 @@ func (s *Server) handleDeploymentsDelete(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	if s.sshClient == nil || s.discoverer == nil {
+	client := s.getClient()
+	disc := s.getDiscoverer()
+	if client == nil || disc == nil {
 		json.NewEncoder(w).Encode(VMActionResponse{APIResponse: APIResponse{Error: "Not connected to Proxmox"}})
 		return
 	}
@@ -1247,7 +1387,7 @@ func (s *Server) handleDeploymentsDelete(w http.ResponseWriter, r *http.Request)
 	}
 
 	// Safety: verify all VMIDs have the versa-deployer tag
-	versaVMs, err := s.discoverer.FindVersaDeployments()
+	versaVMs, err := disc.FindVersaDeployments()
 	if err != nil {
 		json.NewEncoder(w).Encode(VMActionResponse{APIResponse: APIResponse{Error: fmt.Sprintf("Failed to verify VMs: %v", err)}})
 		return
@@ -1268,7 +1408,7 @@ func (s *Server) handleDeploymentsDelete(w http.ResponseWriter, r *http.Request)
 	}
 
 	// All checks passed — stop and destroy each VM
-	vmCreator := proxmox.NewVMCreator(s.sshClient)
+	vmCreator := proxmox.NewVMCreator(client)
 	results := make([]VMActionResult, 0, len(req.VMIDs))
 
 	for _, vmid := range req.VMIDs {

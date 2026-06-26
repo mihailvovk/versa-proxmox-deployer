@@ -34,7 +34,6 @@ type VMConfig struct {
 	Networks    []VMNetwork
 	Tags        []string
 	StartOnBoot bool
-	OnBoot      bool
 }
 
 // VMNetwork holds network interface configuration
@@ -248,7 +247,7 @@ func BuildVMConfigForComponent(
 		ISOFile:     comp.ISOPath,
 		Networks:    networks,
 		Tags:        tags,
-		OnBoot:      true,
+		StartOnBoot: true,
 	}
 }
 

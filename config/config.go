@@ -3,9 +3,11 @@ package config
 import (
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 )
 
 // Config represents the application configuration stored in ./config.json (current working directory)
@@ -37,13 +39,80 @@ type ImageSource struct {
 	Password string `json:"password,omitempty"` // For SFTP sources (not recommended)
 }
 
-// ConfigDir returns the configuration directory path (current working directory)
+var (
+	configDirOnce sync.Once
+	configDirPath string
+)
+
+// ConfigDir returns the per-user configuration directory. It prefers the OS
+// config location (e.g. %AppData% on Windows, ~/Library/Application Support on
+// macOS) so secrets, certs and the image cache don't land in a cloud-synced
+// working directory; it falls back to the executable's directory, then the cwd.
+// The directory is created and a legacy cwd config.json is migrated once.
 func ConfigDir() string {
-	dir, err := os.Getwd()
-	if err != nil {
-		return "."
+	configDirOnce.Do(func() {
+		configDirPath = resolveConfigDir()
+		migrateLegacyConfig(configDirPath)
+	})
+	return configDirPath
+}
+
+func resolveConfigDir() string {
+	if base, err := os.UserConfigDir(); err == nil {
+		dir := filepath.Join(base, "versa-proxmox-deployer")
+		if err := os.MkdirAll(dir, 0700); err == nil {
+			return dir
+		}
 	}
-	return dir
+	if exe, err := os.Executable(); err == nil {
+		return filepath.Dir(exe)
+	}
+	if wd, err := os.Getwd(); err == nil {
+		return wd
+	}
+	return "."
+}
+
+// migrateLegacyConfig copies a config.json from the current working directory
+// (the old storage location) into the new config dir once, so upgrading users
+// keep their saved settings.
+func migrateLegacyConfig(dir string) {
+	newPath := filepath.Join(dir, "config.json")
+	if _, err := os.Stat(newPath); err == nil {
+		return // already have a config in the new location
+	}
+	wd, err := os.Getwd()
+	if err != nil {
+		return
+	}
+	oldPath := filepath.Join(wd, "config.json")
+	if oldPath == newPath {
+		return
+	}
+	data, err := os.ReadFile(oldPath)
+	if err != nil {
+		return // no legacy config to migrate
+	}
+	// Write atomically (temp + rename) — a plain WriteFile interrupted mid-write
+	// would leave a truncated canonical config that the os.Stat guard then never
+	// re-migrates, so Load would fail to parse forever.
+	tmp, err := os.CreateTemp(dir, "config-*.json.tmp")
+	if err != nil {
+		return
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName) // no-op after a successful rename
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return
+	}
+	tmp.Chmod(0600) // best-effort
+	if err := tmp.Close(); err != nil {
+		return
+	}
+	if err := os.Rename(tmpName, newPath); err == nil {
+		slog.Info("migrated config to new location", "from", oldPath, "to", newPath)
+	}
 }
 
 // ConfigPath returns the full path to the config file
@@ -56,12 +125,19 @@ func CacheDir() string {
 	return filepath.Join(ConfigDir(), "images")
 }
 
-// Load reads the configuration from disk
-func Load() (*Config, error) {
-	cfg := &Config{
+// Default returns a Config with all maps/slices initialized. Use this as a
+// fallback when Load fails so callers never dereference a nil Config or write
+// to a nil map.
+func Default() *Config {
+	return &Config{
 		ImageSources: []ImageSource{},
 		CustomImages: make(map[string]string),
 	}
+}
+
+// Load reads the configuration from disk
+func Load() (*Config, error) {
+	cfg := Default()
 
 	data, err := os.ReadFile(ConfigPath())
 	if err != nil {
@@ -87,10 +163,13 @@ func Load() (*Config, error) {
 	return cfg, nil
 }
 
-// Save writes the configuration to disk
+// Save writes the configuration to disk atomically (temp file + rename) so a
+// crash or concurrent writer can never leave a truncated/interleaved config.json.
+// The temp file is created in the same directory so the rename is atomic on the
+// same filesystem (and uses MoveFileEx replace semantics on Windows).
 func (c *Config) Save() error {
-	// Ensure config directory exists
-	if err := os.MkdirAll(ConfigDir(), 0700); err != nil {
+	dir := ConfigDir()
+	if err := os.MkdirAll(dir, 0700); err != nil {
 		return fmt.Errorf("creating config directory: %w", err)
 	}
 
@@ -99,7 +178,25 @@ func (c *Config) Save() error {
 		return fmt.Errorf("marshaling config: %w", err)
 	}
 
-	if err := os.WriteFile(ConfigPath(), data, 0600); err != nil {
+	tmp, err := os.CreateTemp(dir, "config-*.json.tmp")
+	if err != nil {
+		return fmt.Errorf("creating temp config: %w", err)
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName) // no-op after a successful rename
+
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return fmt.Errorf("writing temp config: %w", err)
+	}
+	if err := tmp.Chmod(0600); err != nil { // best-effort; ineffective on Windows ACLs
+		tmp.Close()
+		return fmt.Errorf("setting config permissions: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("closing temp config: %w", err)
+	}
+	if err := os.Rename(tmpName, ConfigPath()); err != nil {
 		return fmt.Errorf("writing config: %w", err)
 	}
 
@@ -134,9 +231,11 @@ func (c *Config) RemoveImageSource(url string) bool {
 	return false
 }
 
-// ExpandPath expands ~ to home directory
+// ExpandPath expands a leading ~ to the home directory. Handles both POSIX
+// (~/foo) and Windows (~\foo) separators. filepath.Join is correct here because
+// this is a local path on the machine the binary runs on, not a remote path.
 func ExpandPath(path string) string {
-	if strings.HasPrefix(path, "~/") {
+	if strings.HasPrefix(path, "~/") || strings.HasPrefix(path, `~\`) {
 		home, err := os.UserHomeDir()
 		if err != nil {
 			return path
@@ -183,6 +282,15 @@ type ComponentConfig struct {
 	Node     string // Target Proxmox node
 	ISOPath  string // Path to ISO on Proxmox
 	Version  string // ISO version string
+}
+
+// EffectiveCount returns the number of VMs this component produces, applying the
+// "Count == 0 means 1" convention used throughout deployment.
+func (c ComponentConfig) EffectiveCount() int {
+	if c.Count == 0 {
+		return 1
+	}
+	return c.Count
 }
 
 // NetworkConfig holds network bridge and VLAN configuration
@@ -274,10 +382,7 @@ func NewDeploymentConfig() *DeploymentConfig {
 // GetTotalResources calculates total resource requirements
 func (dc *DeploymentConfig) GetTotalResources() (cpu int, ramGB int, diskGB int) {
 	for _, comp := range dc.Components {
-		count := comp.Count
-		if count == 0 {
-			count = 1
-		}
+		count := comp.EffectiveCount()
 		cpu += comp.CPU * count
 		ramGB += comp.RAMGB * count
 		diskGB += comp.DiskGB * count
@@ -289,11 +394,7 @@ func (dc *DeploymentConfig) GetTotalResources() (cpu int, ramGB int, diskGB int)
 func (dc *DeploymentConfig) VMCount() int {
 	count := 0
 	for _, comp := range dc.Components {
-		if comp.Count == 0 {
-			count += 1
-		} else {
-			count += comp.Count
-		}
+		count += comp.EffectiveCount()
 	}
 	return count
 }

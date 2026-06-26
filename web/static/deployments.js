@@ -108,7 +108,7 @@ function renderDeploymentTable(container, allVMs) {
             <td>${esc(compType)}</td>
             <td title="${esc(deployedTitle)}">${esc(deployedLabel)}</td>
             <td><span class="vm-status-badge ${statusClass}">${esc(vm.Status)}</span></td>
-            <td>${isRunning ? `<button class="btn-console" onclick="openConsole(${vm.VMID}, '${esc(vm.Name).replace(/'/g, "\\'")}')">Console</button>` : ''}</td>
+            <td>${isRunning ? `<button class="btn-console">Console</button>` : ''}</td>
         </tr>`;
     });
 
@@ -118,6 +118,15 @@ function renderDeploymentTable(container, allVMs) {
     container.appendChild(el);
 
     // --- Event bindings ---
+
+    // Console buttons: read vmid/name from the row's data attributes instead of
+    // an inline onclick (which was a JS-string XSS sink for VM names).
+    el.querySelectorAll('.btn-console').forEach(btn => {
+        btn.addEventListener('click', () => {
+            const row = btn.closest('tr');
+            openConsole(parseInt(row.dataset.vmid), row.dataset.name);
+        });
+    });
 
     const selectAll = el.querySelector('.deploy-select-all');
     const checkboxes = el.querySelectorAll('.deploy-vm-check');
@@ -170,10 +179,19 @@ function renderDeploymentTable(container, allVMs) {
         stopBtn.textContent = 'Stopping...';
 
         try {
-            await api('POST', '/api/deployments/stop', {
+            const result = await api('POST', '/api/deployments/stop', {
                 vmids: selected.map(s => s.vmid),
                 prefix: '',
             });
+
+            if (!result.success) {
+                const failures = (result.results || []).filter(r => !r.success);
+                if (failures.length > 0) {
+                    alert('Some VMs failed to stop:\n' + failures.map(f => `${f.name}: ${f.error}`).join('\n'));
+                } else {
+                    alert('Stop failed: ' + (result.error || 'Unknown error'));
+                }
+            }
             loadDeployments();
         } catch (err) {
             alert('Stop failed: ' + err.message);

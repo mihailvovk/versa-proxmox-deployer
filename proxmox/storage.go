@@ -150,9 +150,12 @@ func (s *StorageManager) FindISOByMD5(storages []StorageInfo, expectedMD5 string
 		}
 		cmd := "md5sum " + strings.Join(paths, " ") + " 2>/dev/null"
 		result, err := s.client.RunWithTimeout(cmd, 10*time.Minute)
-		if err != nil || result.ExitCode != 0 {
+		if err != nil {
 			continue
 		}
+		// md5sum exits non-zero if ANY operand is unreadable, but still prints
+		// correct lines for the readable ones — so parse stdout regardless of the
+		// exit code (a single stale/locked ISO must not defeat dedup).
 
 		for _, line := range strings.Split(result.Stdout, "\n") {
 			parts := strings.Fields(line)
@@ -441,21 +444,31 @@ func (s *StorageManager) findDownloadTask(node, filename string) (string, error)
 			continue
 		}
 
-		// Look for a running download task (prefer running over recently stopped)
+		// Collect download tasks, preferring one whose log mentions our filename.
+		var downloadUPIDs []string
 		for _, t := range tasks {
-			if t.Type == "download" || t.Type == "imgdownload" {
-				// Verify this task is for our file by checking the task log
-				logCmd := fmt.Sprintf("pvesh get /nodes/%s/tasks/%s/log --output-format json --limit 5 2>/dev/null",
-					ssh.ShellEscape(node), ssh.ShellEscape(t.UPID))
-				logResult, err := s.client.Run(logCmd)
-				if err != nil {
-					// Can't verify, but if it's the only download task, use it
-					return t.UPID, nil
-				}
-				if strings.Contains(logResult.Stdout, filename) {
-					return t.UPID, nil
-				}
+			if t.Type != "download" && t.Type != "imgdownload" {
+				continue
 			}
+			downloadUPIDs = append(downloadUPIDs, t.UPID)
+
+			// Verify this task is for our file by checking the task log. On a
+			// read error, skip it — never assume an unverified task is ours.
+			logCmd := fmt.Sprintf("pvesh get /nodes/%s/tasks/%s/log --output-format json --limit 5 2>/dev/null",
+				ssh.ShellEscape(node), ssh.ShellEscape(t.UPID))
+			logResult, err := s.client.Run(logCmd)
+			if err != nil {
+				continue
+			}
+			if strings.Contains(logResult.Stdout, filename) {
+				return t.UPID, nil
+			}
+		}
+
+		// No log matched by name. Only fall back to "the" download task when there
+		// is exactly one — otherwise we'd risk polling someone else's download.
+		if len(downloadUPIDs) == 1 {
+			return downloadUPIDs[0], nil
 		}
 	}
 

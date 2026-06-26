@@ -6,8 +6,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
-	"strings"
 	"time"
 )
 
@@ -17,7 +15,6 @@ type Client struct {
 	username   string
 	password   string
 	httpClient *http.Client
-	authToken  string
 }
 
 // ClientConfig holds configuration for the Director client
@@ -56,45 +53,7 @@ func NewClient(cfg ClientConfig) *Client {
 	}
 }
 
-// Authenticate authenticates with the Director and obtains a token
-func (c *Client) Authenticate() error {
-	// Director uses basic auth or token-based auth
-	// Try to get a session token
-
-	data := url.Values{}
-	data.Set("username", c.username)
-	data.Set("password", c.password)
-
-	req, err := http.NewRequest("POST", c.baseURL+"/versa/login", strings.NewReader(data.Encode()))
-	if err != nil {
-		return fmt.Errorf("creating request: %w", err)
-	}
-
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("authentication request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("authentication failed (status %d): %s", resp.StatusCode, string(body))
-	}
-
-	// Extract token from response or cookies
-	for _, cookie := range resp.Cookies() {
-		if cookie.Name == "JSESSIONID" || strings.Contains(cookie.Name, "token") {
-			c.authToken = cookie.Value
-			break
-		}
-	}
-
-	return nil
-}
-
-// doRequest performs an authenticated API request
+// doRequest performs an authenticated API request using HTTP Basic auth.
 func (c *Client) doRequest(method, path string, body io.Reader) (*http.Response, error) {
 	req, err := http.NewRequest(method, c.baseURL+path, body)
 	if err != nil {
@@ -103,13 +62,7 @@ func (c *Client) doRequest(method, path string, body io.Reader) (*http.Response,
 
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Content-Type", "application/json")
-
-	// Add authentication
-	if c.authToken != "" {
-		req.Header.Set("Authorization", "Bearer "+c.authToken)
-	} else {
-		req.SetBasicAuth(c.username, c.password)
-	}
+	req.SetBasicAuth(c.username, c.password)
 
 	return c.httpClient.Do(req)
 }
@@ -154,12 +107,9 @@ func (c *Client) GetVersion() (string, error) {
 	return result.Version, nil
 }
 
-// Close closes the client connection
+// Close closes the client connection. Basic auth is stateless, so there is no
+// session to tear down.
 func (c *Client) Close() error {
-	// Logout if we have a session
-	if c.authToken != "" {
-		c.doRequest("POST", "/versa/logout", nil)
-	}
 	return nil
 }
 
@@ -191,7 +141,7 @@ func (c *Client) GetDirectorInfo() (*DirectorInfo, error) {
 	if err := c.get("/api/v1/system/info", &result); err != nil {
 		// Try alternative endpoint
 		if err2 := c.get("/vnms/system/status", &result); err2 != nil {
-			return nil, err
+			return nil, fmt.Errorf("director info unavailable: primary endpoint: %v; fallback endpoint: %w", err, err2)
 		}
 	}
 

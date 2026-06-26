@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -23,17 +24,54 @@ type ConsoleSession struct {
 	CreatedAt  time.Time `json:"createdAt"`
 	LastActive time.Time `json:"-"`
 
-	mu        sync.Mutex
+	mu        sync.Mutex // guards LastActive and session state
+	writeMu   sync.Mutex // serializes writes to wsConn (gorilla allows one writer)
 	closeOnce sync.Once
 	wsConn    *websocket.Conn
 	pty       *ssh.PTYSession
 	done      chan struct{}
 }
 
+// consoleWriteTimeout bounds every WebSocket write so a stalled/half-open client
+// can never block a writer indefinitely (which previously wedged the reaper).
+const consoleWriteTimeout = 10 * time.Second
+
+// writeJSON writes a console message under writeMu with a write deadline. It does
+// NOT touch sess.mu, so the reaper and close path are never blocked by a slow
+// client.
+func (sess *ConsoleSession) writeJSON(msg consoleMessage) error {
+	sess.writeMu.Lock()
+	defer sess.writeMu.Unlock()
+	sess.wsConn.SetWriteDeadline(time.Now().Add(consoleWriteTimeout))
+	return sess.wsConn.WriteJSON(msg)
+}
+
+// writeClose sends a close frame under writeMu with a write deadline.
+func (sess *ConsoleSession) writeClose(code int, text string) {
+	sess.writeMu.Lock()
+	defer sess.writeMu.Unlock()
+	sess.wsConn.SetWriteDeadline(time.Now().Add(consoleWriteTimeout))
+	sess.wsConn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(code, text))
+}
+
 var (
 	consoleSessions sync.Map
-	wsUpgrader      = websocket.Upgrader{
-		CheckOrigin: func(r *http.Request) bool { return true },
+	wsUpgrader = websocket.Upgrader{
+		// Only accept same-origin WebSocket handshakes to prevent cross-site
+		// WebSocket hijacking of the VM serial console. The browser sets Origin
+		// to the page's origin (which equals r.Host here); non-browser clients
+		// send no Origin and are rejected.
+		CheckOrigin: func(r *http.Request) bool {
+			origin := r.Header.Get("Origin")
+			if origin == "" {
+				return false
+			}
+			u, err := url.Parse(origin)
+			if err != nil {
+				return false
+			}
+			return strings.EqualFold(u.Host, r.Host)
+		},
 		ReadBufferSize:  4096,
 		WriteBufferSize: 4096,
 	}
@@ -52,7 +90,8 @@ type consoleMessage struct {
 // Requires `serial0: socket` configured on the VM. If no serial device is found,
 // sends a clear error message and closes the connection.
 func (s *Server) handleConsoleSerial(w http.ResponseWriter, r *http.Request) {
-	if s.sshClient == nil {
+	client := s.getClient()
+	if client == nil {
 		http.Error(w, "Not connected to Proxmox", http.StatusBadRequest)
 		return
 	}
@@ -75,7 +114,7 @@ func (s *Server) handleConsoleSerial(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Check if VM has a serial device configured
-	checkResult, _ := s.sshClient.Run(fmt.Sprintf("qm config %d 2>/dev/null | grep -q '^serial0:' && echo yes || echo no", vmid))
+	checkResult, _ := client.Run(fmt.Sprintf("qm config %d 2>/dev/null | grep -q '^serial0:' && echo yes || echo no", vmid))
 	hasSerial := checkResult != nil && strings.TrimSpace(checkResult.Stdout) == "yes"
 
 	// Upgrade to WebSocket
@@ -84,6 +123,10 @@ func (s *Server) handleConsoleSerial(w http.ResponseWriter, r *http.Request) {
 		slog.Error("console serial: websocket upgrade failed", "error", err, "vmid", vmid)
 		return
 	}
+	// Bound all handshake-phase writes (before the ConsoleSession exists) so a
+	// half-open client can't block this handler goroutine indefinitely. The pump
+	// resets the deadline per write via writeJSON once the session is live.
+	wsConn.SetWriteDeadline(time.Now().Add(consoleWriteTimeout))
 
 	// If no serial device, send an error and close — don't fall back to qm monitor
 	if !hasSerial {
@@ -121,7 +164,7 @@ func (s *Server) handleConsoleSerial(w http.ResponseWriter, r *http.Request) {
 	)
 
 	// Create PTY session
-	pty, err := ssh.NewPTYSession(s.sshClient, command, cols, rows)
+	pty, err := ssh.NewPTYSession(client, command, cols, rows)
 	if err != nil {
 		slog.Error("console serial: PTY creation failed", "error", err, "vmid", vmid, "command", command)
 		wsConn.WriteJSON(consoleMessage{
@@ -161,9 +204,9 @@ func (s *Server) handleConsoleSerial(w http.ResponseWriter, r *http.Request) {
 			if n > 0 {
 				sess.mu.Lock()
 				sess.LastActive = time.Now()
-				writeErr := wsConn.WriteJSON(consoleMessage{Type: "data", Data: string(buf[:n])})
 				sess.mu.Unlock()
-				if writeErr != nil {
+				// Bounded write outside sess.mu so a stalled client can't wedge the reaper.
+				if writeErr := sess.writeJSON(consoleMessage{Type: "data", Data: string(buf[:n])}); writeErr != nil {
 					break
 				}
 			}
@@ -222,7 +265,8 @@ func (s *Server) handleConsoleSerial(w http.ResponseWriter, r *http.Request) {
 // handleConsoleTest runs diagnostic checks for console connectivity.
 // GET /api/console/test?vmid=123
 func (s *Server) handleConsoleTest(w http.ResponseWriter, r *http.Request) {
-	if s.sshClient == nil {
+	client := s.getClient()
+	if client == nil {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "error": "Not connected"})
 		return
@@ -243,16 +287,16 @@ func (s *Server) handleConsoleTest(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 1. Check VM exists and is running
-	result, err := s.sshClient.Run(fmt.Sprintf("qm status %d 2>&1", vmid))
-	if err != nil {
+	result, err := client.Run(fmt.Sprintf("qm status %d 2>&1", vmid))
+	if err != nil || result == nil {
 		addCheck(fmt.Sprintf("FAIL: cannot check VM status: %v", err))
 	} else {
 		addCheck(fmt.Sprintf("VM status: %s", strings.TrimSpace(result.Stdout)))
 	}
 
 	// 2. Check serial0 config
-	result, err = s.sshClient.Run(fmt.Sprintf("qm config %d 2>/dev/null | grep serial", vmid))
-	if err != nil || strings.TrimSpace(result.Stdout) == "" {
+	result, err = client.Run(fmt.Sprintf("qm config %d 2>/dev/null | grep serial", vmid))
+	if err != nil || result == nil || strings.TrimSpace(result.Stdout) == "" {
 		addCheck("FAIL: no serial device in VM config")
 	} else {
 		addCheck(fmt.Sprintf("Serial config: %s", strings.TrimSpace(result.Stdout)))
@@ -260,19 +304,24 @@ func (s *Server) handleConsoleTest(w http.ResponseWriter, r *http.Request) {
 
 	// 3. Check if serial socket exists
 	socketPath := fmt.Sprintf("/var/run/qemu-server/%d.serial0", vmid)
-	result, err = s.sshClient.Run(fmt.Sprintf("ls -la '%s' 2>&1", socketPath))
-	if err != nil || result.ExitCode != 0 {
-		addCheck(fmt.Sprintf("FAIL: serial socket not found at %s: %s", socketPath, strings.TrimSpace(result.Stdout)))
+	result, err = client.Run(fmt.Sprintf("ls -la '%s' 2>&1", socketPath))
+	if err != nil || result == nil || result.ExitCode != 0 {
+		out := ""
+		if result != nil {
+			out = strings.TrimSpace(result.Stdout)
+		}
+		addCheck(fmt.Sprintf("FAIL: serial socket not found at %s: %s", socketPath, out))
 	} else {
 		addCheck(fmt.Sprintf("Serial socket: %s", strings.TrimSpace(result.Stdout)))
 	}
 
 	// 4. Check what sockets exist for this VM
-	result, _ = s.sshClient.Run(fmt.Sprintf("ls -la /var/run/qemu-server/%d.* 2>&1", vmid))
-	addCheck(fmt.Sprintf("VM sockets: %s", strings.TrimSpace(result.Stdout)))
+	if result, _ = client.Run(fmt.Sprintf("ls -la /var/run/qemu-server/%d.* 2>&1", vmid)); result != nil {
+		addCheck(fmt.Sprintf("VM sockets: %s", strings.TrimSpace(result.Stdout)))
+	}
 
 	// 5. Check if socat is available
-	result, _ = s.sshClient.Run("command -v socat 2>&1")
+	result, _ = client.Run("command -v socat 2>&1")
 	if result != nil && result.ExitCode == 0 {
 		addCheck(fmt.Sprintf("socat: %s", strings.TrimSpace(result.Stdout)))
 	} else {
@@ -280,13 +329,15 @@ func (s *Server) handleConsoleTest(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 6. Check qm terminal availability
-	result, _ = s.sshClient.Run("command -v qm 2>&1")
-	addCheck(fmt.Sprintf("qm: %s", strings.TrimSpace(result.Stdout)))
+	if result, _ = client.Run("command -v qm 2>&1"); result != nil {
+		addCheck(fmt.Sprintf("qm: %s", strings.TrimSpace(result.Stdout)))
+	}
 
 	// 7. Try a quick qm terminal test (1 second timeout)
-	result, _ = s.sshClient.Run(fmt.Sprintf("timeout 2 qm terminal %d </dev/null 2>&1 || true", vmid))
-	addCheck(fmt.Sprintf("qm terminal test (2s): exit=%d stdout=%q stderr=%q",
-		result.ExitCode, strings.TrimSpace(result.Stdout), strings.TrimSpace(result.Stderr)))
+	if result, _ = client.Run(fmt.Sprintf("timeout 2 qm terminal %d </dev/null 2>&1 || true", vmid)); result != nil {
+		addCheck(fmt.Sprintf("qm terminal test (2s): exit=%d stdout=%q stderr=%q",
+			result.ExitCode, strings.TrimSpace(result.Stdout), strings.TrimSpace(result.Stderr)))
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
@@ -334,16 +385,13 @@ func closeConsoleSession(sess *ConsoleSession) {
 		duration := time.Since(sess.CreatedAt).Round(time.Second)
 		slog.Info("console: session closed", "session", sess.ID, "vmid", sess.VMID, "type", sess.Type, "duration", duration)
 
-		// Close WebSocket with close frame
-		sess.mu.Lock()
+		// Close WebSocket with a bounded close frame, then close the conn. The
+		// write is guarded by writeMu (not sess.mu) with a deadline so a dead
+		// client can't block teardown.
 		if sess.wsConn != nil {
-			sess.wsConn.WriteMessage(
-				websocket.CloseMessage,
-				websocket.FormatCloseMessage(websocket.CloseNormalClosure, "session ended"),
-			)
+			sess.writeClose(websocket.CloseNormalClosure, "session ended")
 			sess.wsConn.Close()
 		}
-		sess.mu.Unlock()
 
 		// Close PTY
 		if sess.pty != nil {

@@ -103,10 +103,15 @@ func (s *SFTPSource) connect() (*sftp.Client, func(), error) {
 		return nil, nil, fmt.Errorf("no authentication method available")
 	}
 
+	hostKeyCallback, err := ssh.TOFUHostKeyCallback()
+	if err != nil {
+		return nil, nil, fmt.Errorf("host key verification setup: %w", err)
+	}
+
 	sshConfig := &gossh.ClientConfig{
 		User:            s.sftpCfg.User,
 		Auth:            authMethods,
-		HostKeyCallback: gossh.InsecureIgnoreHostKey(),
+		HostKeyCallback: hostKeyCallback,
 	}
 
 	// Connect SSH
@@ -143,8 +148,9 @@ func (s *SFTPSource) List() ([]ISOFile, error) {
 	md5Files := make(map[string]string) // ISO filename -> MD5 file full path
 	var isos []ISOFile
 
-	// Walk the directory tree
-	err = s.walkDir(client, s.path, func(path string, info os.FileInfo) {
+	// Walk the directory tree. A subdirectory error yields a partial listing plus
+	// a non-nil error (surfaced by ScanAllSources) rather than being swallowed.
+	walkErr := s.walkDir(client, s.path, func(path string, info os.FileInfo) {
 		name := info.Name()
 		if IsMD5File(name) {
 			isoName := GetISOForMD5(name)
@@ -155,11 +161,8 @@ func (s *SFTPSource) List() ([]ISOFile, error) {
 			isos = append(isos, iso)
 		}
 	})
-	if err != nil {
-		return nil, fmt.Errorf("walking directory: %w", err)
-	}
 
-	// Match MD5 files with ISOs
+	// Match MD5 files with ISOs (best-effort, even on a partial walk)
 	for i := range isos {
 		if md5Path, ok := md5Files[isos[i].Filename]; ok {
 			isos[i].HasMD5File = true
@@ -172,6 +175,9 @@ func (s *SFTPSource) List() ([]ISOFile, error) {
 		}
 	}
 
+	if walkErr != nil {
+		return isos, fmt.Errorf("walking directory: %w", walkErr)
+	}
 	return isos, nil
 }
 
@@ -179,19 +185,25 @@ func (s *SFTPSource) List() ([]ISOFile, error) {
 func (s *SFTPSource) walkDir(client *sftp.Client, path string, fn func(path string, info os.FileInfo)) error {
 	entries, err := client.ReadDir(path)
 	if err != nil {
-		return err
+		return fmt.Errorf("reading %s: %w", path, err)
 	}
 
+	var errs []string
 	for _, entry := range entries {
 		fullPath := path + "/" + entry.Name()
 		if entry.IsDir() {
-			// Recurse into subdirectory
-			s.walkDir(client, fullPath, fn)
+			// Recurse into subdirectory, accumulating (not swallowing) errors
+			if werr := s.walkDir(client, fullPath, fn); werr != nil {
+				errs = append(errs, werr.Error())
+			}
 		} else {
 			fn(fullPath, entry)
 		}
 	}
 
+	if len(errs) > 0 {
+		return fmt.Errorf("%s", strings.Join(errs, "; "))
+	}
 	return nil
 }
 

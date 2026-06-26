@@ -27,19 +27,19 @@ async function renderSourcesList() {
         const item = document.createElement('div');
         item.className = 'source-item';
         item.innerHTML = `
-            <span class="source-type">${esc(src.Type || 'auto')}</span>
-            <span class="source-name">${esc(src.Name || '')}</span>
-            <span class="source-url" title="${esc(src.URL)}">${esc(src.URL)}</span>
+            <span class="source-type">${esc(src.type || 'auto')}</span>
+            <span class="source-name">${esc(src.name || '')}</span>
+            <span class="source-url" title="${esc(src.url)}">${esc(src.url)}</span>
         `;
         const removeBtn = document.createElement('button');
         removeBtn.className = 'btn-remove';
         removeBtn.textContent = 'Remove';
         removeBtn.addEventListener('click', async () => {
-            const label = src.Name || src.URL;
+            const label = src.name || src.url;
             if (!confirm('Remove source: ' + label + '?')) return;
             removeBtn.disabled = true;
             removeBtn.textContent = 'Removing...';
-            const result = await api('DELETE', '/api/sources', { url: src.URL, index: idx });
+            const result = await api('DELETE', '/api/sources', { url: src.url, index: idx });
             if (result.sources) {
                 state.configSources = result.sources;
             }

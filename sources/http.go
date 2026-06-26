@@ -133,20 +133,23 @@ func (s *HTTPSource) parseDirectoryListingWithDirs(html string, baseURL string) 
 			continue
 		}
 
-		// URL decode if necessary
+		// Keep the original (percent-encoded) href for building request URLs;
+		// decode only for the human-readable filename and component detection.
+		// Using the decoded form in the URL breaks names with spaces/specials.
+		encodedHref := href
+		decodedHref := href
 		if decoded, err := url.QueryUnescape(href); err == nil {
-			href = decoded
+			decodedHref = decoded
 		}
 
 		// Check if it's a directory (ends with /)
-		if strings.HasSuffix(href, "/") {
-			subdirURL := baseURL + href
-			subdirs = append(subdirs, subdirURL)
+		if strings.HasSuffix(decodedHref, "/") {
+			subdirs = append(subdirs, baseURL+encodedHref)
 			continue
 		}
 
-		// Get just the filename
-		filename := filepath.Base(href)
+		// Get just the filename (decoded, for display/component detection)
+		filename := filepath.Base(decodedHref)
 
 		if IsMD5File(filename) {
 			md5Files[GetISOForMD5(filename)] = true
@@ -162,19 +165,20 @@ func (s *HTTPSource) parseDirectoryListingWithDirs(html string, baseURL string) 
 		}
 		seen[filename] = true
 
-		// Build full URL
-		fileURL := baseURL + href
+		// Build full URL from the encoded href so the request stays valid
+		fileURL := baseURL + encodedHref
 
 		iso := ParseISOFilename(filename, s.name, s.Type(), fileURL)
 
 		isos = append(isos, iso)
 	}
 
-	// Update MD5 status for found ISOs
+	// Update MD5 status for found ISOs. Derive the .md5 URL from the (encoded)
+	// ISO SourceURL so special characters survive into the request.
 	for i := range isos {
 		if md5Files[isos[i].Filename] {
 			isos[i].HasMD5File = true
-			isos[i].MD5FileURL = baseURL + isos[i].Filename + ".md5"
+			isos[i].MD5FileURL = isos[i].SourceURL + ".md5"
 		}
 	}
 

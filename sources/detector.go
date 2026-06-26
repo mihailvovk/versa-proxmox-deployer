@@ -3,11 +3,15 @@ package sources
 import (
 	"fmt"
 	"os"
+	"regexp"
 	"strings"
 
 	"github.com/mihailvovk/versa-proxmox-deployer/config"
 	"github.com/mihailvovk/versa-proxmox-deployer/ssh"
 )
+
+// winLocalPathRe matches Windows drive-letter paths like C:\images or C:/images.
+var winLocalPathRe = regexp.MustCompile(`^[A-Za-z]:[\\/]`)
 
 // SourceType represents the type of image source
 type SourceType string
@@ -34,6 +38,9 @@ func DetectSourceType(url string) SourceType {
 	case strings.HasPrefix(lower, "http://") || strings.HasPrefix(lower, "https://"):
 		return SourceTypeHTTP
 	case strings.HasPrefix(url, "/") || strings.HasPrefix(url, "~"):
+		return SourceTypeLocal
+	case winLocalPathRe.MatchString(url) || strings.HasPrefix(url, `\\`):
+		// Windows drive-letter (C:\...) or UNC (\\server\share) path
 		return SourceTypeLocal
 	default:
 		// Check if it's a local path that exists
@@ -99,16 +106,18 @@ func CreateSource(src config.ImageSource) (ImageSource, error) {
 	}
 }
 
-// CreateSourcesFromConfig creates ImageSources from config
-func CreateSourcesFromConfig(cfg *config.Config) ([]ImageSource, error) {
+// CreateSourcesFromConfig creates ImageSources from a list of configured image
+// sources. Callers pass a snapshot of the slice (not the live config field) so
+// concurrent config mutation can't tear the slice header mid-iteration.
+func CreateSourcesFromConfig(srcs []config.ImageSource) ([]ImageSource, error) {
 	var sources []ImageSource
 
 	// If no sources configured, return empty list — user must add sources
-	if len(cfg.ImageSources) == 0 {
+	if len(srcs) == 0 {
 		return sources, nil
 	}
 
-	for _, src := range cfg.ImageSources {
+	for _, src := range srcs {
 		source, err := CreateSource(src)
 		if err != nil {
 			// Log error but continue with other sources

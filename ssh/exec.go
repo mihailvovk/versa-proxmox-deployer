@@ -4,10 +4,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"strings"
 	"time"
+
+	gossh "golang.org/x/crypto/ssh"
 )
 
 // ExecResult holds the result of a command execution
@@ -52,8 +55,11 @@ func (c *Client) RunWithTimeout(cmd string, timeout time.Duration) (*ExecResult,
 		}
 
 		if err != nil {
-			// Try to extract exit code
-			if exitErr, ok := err.(*ExitError); ok {
+			// Extract the real remote exit status. session.Run returns
+			// *gossh.ExitError; anything else (transport failure, signal) has no
+			// numeric code, so fall back to 1.
+			var exitErr *gossh.ExitError
+			if errors.As(err, &exitErr) {
 				result.ExitCode = exitErr.ExitStatus()
 			} else {
 				result.ExitCode = 1
@@ -147,9 +153,15 @@ func (c *Client) Upload(localPath, remotePath string, progress func(written, tot
 		return fmt.Errorf("getting file info: %w", err)
 	}
 
+	// Open stdin before launching the feeder so a pipe error is surfaced here
+	// rather than panicking on a nil writer inside the goroutine.
+	w, err := session.StdinPipe()
+	if err != nil {
+		return fmt.Errorf("opening SCP stdin: %w", err)
+	}
+
 	// Set up SCP
 	go func() {
-		w, _ := session.StdinPipe()
 		defer w.Close()
 
 		// Send file header
@@ -168,7 +180,7 @@ func (c *Client) Upload(localPath, remotePath string, progress func(written, tot
 	}()
 
 	// Run SCP receive
-	output, err := session.CombinedOutput(fmt.Sprintf("scp -t %s", remotePath))
+	output, err := session.CombinedOutput(fmt.Sprintf("scp -t %s", ShellEscape(remotePath)))
 	if err != nil {
 		return fmt.Errorf("SCP failed: %w (output: %s)", err, string(output))
 	}
@@ -184,8 +196,12 @@ func (c *Client) UploadBytes(data []byte, remotePath string) error {
 	}
 	defer session.Close()
 
+	w, err := session.StdinPipe()
+	if err != nil {
+		return fmt.Errorf("opening SCP stdin: %w", err)
+	}
+
 	go func() {
-		w, _ := session.StdinPipe()
 		defer w.Close()
 
 		fmt.Fprintf(w, "C0644 %d %s\n", len(data), getBasename(remotePath))
@@ -193,7 +209,7 @@ func (c *Client) UploadBytes(data []byte, remotePath string) error {
 		fmt.Fprint(w, "\x00")
 	}()
 
-	output, err := session.CombinedOutput(fmt.Sprintf("scp -t %s", remotePath))
+	output, err := session.CombinedOutput(fmt.Sprintf("scp -t %s", ShellEscape(remotePath)))
 	if err != nil {
 		return fmt.Errorf("SCP failed: %w (output: %s)", err, string(output))
 	}
@@ -212,26 +228,12 @@ func (c *Client) Download(remotePath, localPath string) error {
 	var stdout bytes.Buffer
 	session.Stdout = &stdout
 
-	err = session.Run(fmt.Sprintf("cat %s", remotePath))
+	err = session.Run(fmt.Sprintf("cat %s", ShellEscape(remotePath)))
 	if err != nil {
 		return fmt.Errorf("reading remote file: %w", err)
 	}
 
 	return writeFile(localPath, stdout.Bytes())
-}
-
-// ExitError wraps SSH exit errors
-type ExitError struct {
-	exitStatus int
-	msg        string
-}
-
-func (e *ExitError) Error() string {
-	return e.msg
-}
-
-func (e *ExitError) ExitStatus() int {
-	return e.exitStatus
 }
 
 // progressWriter wraps a writer with progress callback

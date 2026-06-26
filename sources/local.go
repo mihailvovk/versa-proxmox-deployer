@@ -2,6 +2,7 @@ package sources
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -123,9 +124,13 @@ func (s *LocalSource) Download(iso ISOFile, destPath string, progress func(downl
 	// Remove existing dest if any (could be stale symlink)
 	os.Remove(destPath)
 
-	// Symlink instead of copying — local files don't need to be duplicated
+	// Prefer a symlink (no duplication), but fall back to a real copy when
+	// symlinks aren't permitted — notably on Windows without Developer Mode/admin.
 	if err := os.Symlink(srcPath, destPath); err != nil {
-		return fmt.Errorf("creating symlink: %w", err)
+		if copyErr := copyFileWithProgress(srcPath, destPath, info.Size(), progress); copyErr != nil {
+			return fmt.Errorf("symlink failed (%v) and copy fallback failed: %w", err, copyErr)
+		}
+		return nil
 	}
 
 	if progress != nil {
@@ -133,6 +138,43 @@ func (s *LocalSource) Download(iso ISOFile, destPath string, progress func(downl
 	}
 
 	return nil
+}
+
+// copyFileWithProgress copies src to dst, reporting progress as it goes.
+func copyFileWithProgress(src, dst string, total int64, progress func(downloaded, total int64)) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+
+	out, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+
+	buf := make([]byte, 1<<20)
+	var done int64
+	for {
+		n, rerr := in.Read(buf)
+		if n > 0 {
+			if _, werr := out.Write(buf[:n]); werr != nil {
+				return werr
+			}
+			done += int64(n)
+			if progress != nil {
+				progress(done, total)
+			}
+		}
+		if rerr == io.EOF {
+			break
+		}
+		if rerr != nil {
+			return rerr
+		}
+	}
+	return out.Sync()
 }
 
 // readMD5File reads an MD5 checksum from a .md5 file

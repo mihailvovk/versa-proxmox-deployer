@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"strings"
 
 	"github.com/spf13/cobra"
 
@@ -76,6 +77,7 @@ func main() {
 	statusCmd.Flags().String("director", "", "Director IP address")
 	statusCmd.Flags().String("username", "Administrator", "Director username")
 	statusCmd.Flags().String("password", "", "Director password")
+	statusCmd.Flags().Bool("insecure", false, "Skip Director TLS certificate verification (for self-signed appliances)")
 	rootCmd.AddCommand(statusCmd)
 
 	// Releases command
@@ -114,7 +116,7 @@ func runWebUI(httpPort, httpsPort int) {
 	cfg, err := config.Load()
 	if err != nil {
 		slog.Warn("could not load config", "error", err)
-		cfg = &config.Config{}
+		cfg = config.Default()
 	}
 
 	srv := web.NewServer(cfg, httpsPort)
@@ -185,7 +187,13 @@ func runDeploy(cmd *cobra.Command, args []string) {
 	componentStrs, _ := cmd.Flags().GetStringSlice("components")
 	for _, cs := range componentStrs {
 		compType := config.ComponentType(cs)
-		spec := config.DefaultVMSpecs[compType]
+		spec, ok := config.DefaultVMSpecs[compType]
+		if !ok {
+			// Reject an unknown name up front instead of silently building a
+			// zero-spec VM (cores 0 / 0GB) that only fails late during qm create.
+			fmt.Fprintf(os.Stderr, "Error: unknown component %q\n", cs)
+			os.Exit(1)
+		}
 		deployCfg.Components = append(deployCfg.Components, config.ComponentConfig{
 			Type:   compType,
 			Count:  1,
@@ -201,8 +209,12 @@ func runDeploy(cmd *cobra.Command, args []string) {
 	}
 
 	// Create sources and deployer
-	cfg, _ := config.Load()
-	imageSources, _ := sources.CreateSourcesFromConfig(cfg)
+	cfg, err := config.Load()
+	if err != nil {
+		slog.Warn("could not load config", "error", err)
+		cfg = config.Default()
+	}
+	imageSources, _ := sources.CreateSourcesFromConfig(cfg.ImageSources)
 
 	d := deployer.NewDeployer(client, imageSources)
 	d.SetConfig(deployCfg)
@@ -236,10 +248,15 @@ func runStatus(cmd *cobra.Command, args []string) {
 	directorIP, _ := cmd.Flags().GetString("director")
 	username, _ := cmd.Flags().GetString("username")
 	password, _ := cmd.Flags().GetString("password")
+	insecure, _ := cmd.Flags().GetBool("insecure")
 
 	if directorIP == "" {
 		// Try to load from config
-		cfg, _ := config.Load()
+		cfg, err := config.Load()
+		if err != nil {
+			slog.Warn("could not load config", "error", err)
+			cfg = config.Default()
+		}
 		if cfg.DirectorIP != "" {
 			directorIP = cfg.DirectorIP
 		} else {
@@ -257,14 +274,18 @@ func runStatus(cmd *cobra.Command, args []string) {
 		Host:     directorIP,
 		Username: username,
 		Password: password,
-		Insecure: true,
+		Insecure: insecure,
 	})
 
 	fmt.Printf("Connecting to Director at %s...\n", directorIP)
 
 	status, err := client.GetHeadEndStatus()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to get status: %v\n", err)
+		if !insecure && (strings.Contains(err.Error(), "x509") || strings.Contains(err.Error(), "certificate")) {
+			fmt.Fprintf(os.Stderr, "TLS verification failed: %v\nIf this is a self-signed Director appliance, re-run with --insecure.\n", err)
+		} else {
+			fmt.Fprintf(os.Stderr, "Failed to get status: %v\n", err)
+		}
 		os.Exit(1)
 	}
 
@@ -284,12 +305,6 @@ func runStatus(cmd *cobra.Command, args []string) {
 	for _, ctrl := range status.Controllers {
 		printComp(ctrl)
 	}
-	for _, router := range status.Routers {
-		printComp(router)
-	}
-	if status.Concerto != nil {
-		printComp(status.Concerto)
-	}
 
 	// Also get branch status
 	branchStatus, err := client.GetBranchStatus()
@@ -300,8 +315,12 @@ func runStatus(cmd *cobra.Command, args []string) {
 }
 
 func runReleases(cmd *cobra.Command, args []string) {
-	cfg, _ := config.Load()
-	imageSources, err := sources.CreateSourcesFromConfig(cfg)
+	cfg, err := config.Load()
+	if err != nil {
+		slog.Warn("could not load config", "error", err)
+		cfg = config.Default()
+	}
+	imageSources, err := sources.CreateSourcesFromConfig(cfg.ImageSources)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
@@ -366,7 +385,11 @@ func runGenerateMD5(cmd *cobra.Command, args []string) {
 }
 
 func runAddSource(cmd *cobra.Command, args []string) {
-	cfg, _ := config.Load()
+	cfg, err := config.Load()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: cannot read config (%v); fix or remove %s before adding a source\n", err, config.ConfigPath())
+		os.Exit(1)
+	}
 
 	if len(args) == 0 {
 		fmt.Fprintln(os.Stderr, "Error: URL argument is required (e.g., versa-deployer add-source https://...)")

@@ -2,6 +2,7 @@ package deployer
 
 import (
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -22,6 +23,10 @@ type Deployer struct {
 	config     *config.DeploymentConfig
 	proxmoxInfo *proxmox.ProxmoxInfo
 	knownImages []sources.ISOFile
+
+	// connectedNode caches the PVE node name of the SSH-connected host (its short
+	// hostname). Empty until first resolved or if it can't be determined.
+	connectedNode string
 
 	// Rollback tracking
 	createdVMIDs []int
@@ -97,9 +102,41 @@ func (d *Deployer) SetConfig(cfg *config.DeploymentConfig) {
 	d.config = cfg
 }
 
-// SetKnownImages sets the scanned ISO images available from sources
+// SetKnownImages sets the scanned ISO images available from sources. It takes a
+// private copy: prepareImages mutates ISOFile.MD5 in place, and the caller's
+// slice (web.DiscoveryState.Images) is JSON-encoded concurrently by the
+// discovery handler — sharing the backing array would be a data race on the
+// string field. All ISOFile fields are value types, so a shallow append-copy is
+// a complete deep copy.
 func (d *Deployer) SetKnownImages(images []sources.ISOFile) {
-	d.knownImages = images
+	d.knownImages = append([]sources.ISOFile(nil), images...)
+}
+
+// connectedNodeName returns the PVE node name of the host the SSH session is
+// connected to (its short hostname), memoized. Returns "" if it can't be
+// determined, in which case cross-node guards are skipped.
+func (d *Deployer) connectedNodeName() string {
+	if d.connectedNode != "" {
+		return d.connectedNode
+	}
+	if res, err := d.sshClient.Run("hostname -s"); err == nil && res != nil {
+		if name := strings.TrimSpace(res.Stdout); name != "" {
+			d.connectedNode = name
+		}
+	}
+	return d.connectedNode
+}
+
+// defaultNodeName is the node used when a component doesn't specify one: the
+// connected node, falling back to the first discovered node.
+func (d *Deployer) defaultNodeName() string {
+	if n := d.connectedNodeName(); n != "" {
+		return n
+	}
+	if d.proxmoxInfo != nil && len(d.proxmoxInfo.Nodes) > 0 {
+		return d.proxmoxInfo.Nodes[0].Name
+	}
+	return ""
 }
 
 // Discover performs Proxmox environment discovery
@@ -127,6 +164,12 @@ func (d *Deployer) Validate() error {
 
 	d.log("Validating deployment configuration...")
 
+	// Refuse to "succeed" with nothing to do — this is what made a
+	// deploy of an unchecked component silently report completion.
+	if d.config.VMCount() == 0 {
+		return fmt.Errorf("no components selected to deploy — enable at least one component (check its box in the components table) before deploying")
+	}
+
 	// Check total resources required
 	totalCPU, totalRAM, totalDisk := d.config.GetTotalResources()
 
@@ -147,33 +190,61 @@ func (d *Deployer) Validate() error {
 		return fmt.Errorf("insufficient storage: need %dGB but only %dGB available", totalDisk, targetStorage.AvailableGB)
 	}
 
-	// Check each target node has enough resources
+	// Every VM lifecycle op (qm create/start/status/destroy) runs over the single
+	// SSH session and therefore only affects the connected node. A component that
+	// explicitly targets a different node would be silently created on the wrong
+	// host, so reject cross-node placement up front rather than misreporting it.
+	localNode := d.connectedNodeName()
+	for _, comp := range d.config.Components {
+		if comp.Node != "" && localNode != "" && !strings.EqualFold(comp.Node, localNode) {
+			return fmt.Errorf("component %s targets node %q, but this tool deploys only to the connected node %q — connect to %q and deploy there",
+				comp.Type, comp.Node, localNode, comp.Node)
+		}
+	}
+
+	// Aggregate per-node demand across ALL components (a node hosting several
+	// components must fit their sum, not each one independently). Count==0 means 1.
+	type nodeDemand struct{ cpu, ram int }
+	demand := make(map[string]nodeDemand)
 	for _, comp := range d.config.Components {
 		node := comp.Node
-		if node == "" && len(d.proxmoxInfo.Nodes) > 0 {
-			node = d.proxmoxInfo.Nodes[0].Name
+		if node == "" {
+			node = d.defaultNodeName()
 		}
+		n := comp.EffectiveCount()
+		cur := demand[node]
+		cur.cpu += comp.CPU * n
+		cur.ram += comp.RAMGB * n
+		demand[node] = cur
+	}
 
+	for node, need := range demand {
+		// Index-based lookup avoids taking the address of a range variable.
 		var targetNode *proxmox.NodeInfo
-		for _, n := range d.proxmoxInfo.Nodes {
-			if n.Name == node {
-				targetNode = &n
+		for i := range d.proxmoxInfo.Nodes {
+			if d.proxmoxInfo.Nodes[i].Name == node {
+				targetNode = &d.proxmoxInfo.Nodes[i]
 				break
 			}
 		}
-
 		if targetNode == nil {
 			return fmt.Errorf("node '%s' not found", node)
 		}
-
 		if targetNode.Status != "online" {
 			return fmt.Errorf("node '%s' is not online", node)
 		}
 
+		// RAM is a hard limit (overcommit risks OOM and failed starts).
 		availableRAM := targetNode.RAMGB - targetNode.RAMUsedGB
-		if comp.RAMGB*comp.Count > availableRAM {
+		if need.ram > availableRAM {
 			return fmt.Errorf("insufficient RAM on node '%s': need %dGB but only %dGB available",
-				node, comp.RAMGB*comp.Count, availableRAM)
+				node, need.ram, availableRAM)
+		}
+		// CPU overcommit is legitimate on Proxmox, so warn instead of failing.
+		availableCPU := targetNode.CPUCores - targetNode.CPUUsed
+		if need.cpu > availableCPU {
+			d.log(fmt.Sprintf("WARNING: node '%s' may be CPU-overcommitted: need %d vCPU but only %d available",
+				node, need.cpu, availableCPU))
 		}
 	}
 
@@ -303,9 +374,22 @@ func (d *Deployer) prepareImages() error {
 			return fmt.Errorf("ISO metadata not found for %s — ensure image sources are configured", isoFile)
 		}
 
+		// Resolve the MD5 from the source's .md5 companion if the scan only noted
+		// its presence. Without this, MD5 dedup and the remote integrity check
+		// below silently skip for http/dropbox/s3 sources.
+		if isoMeta.MD5 == "" {
+			if md5 := d.downloader.ResolveMD5(*isoMeta); md5 != "" {
+				isoMeta.MD5 = md5
+			}
+		}
+
 		// 2. Check if same content exists under a different filename (MD5 match)
 		if isoMeta.MD5 != "" {
-			d.log(fmt.Sprintf("Checking for existing ISO by MD5 (%s)...", isoMeta.MD5[:8]))
+			shortMD5 := isoMeta.MD5
+			if len(shortMD5) > 8 {
+				shortMD5 = shortMD5[:8]
+			}
+			d.log(fmt.Sprintf("Checking for existing ISO by MD5 (%s)...", shortMD5))
 			stor, existingFile, err := d.storage.FindISOByMD5(isoStorages, isoMeta.MD5)
 			if err == nil {
 				d.log(fmt.Sprintf("Found matching ISO by MD5 on %s: %s (reusing for %s)", stor, existingFile, isoFile))
@@ -317,7 +401,12 @@ func (d *Deployer) prepareImages() error {
 
 		// 3. Try direct download to Proxmox (skips local download + SCP)
 		if sources.SupportsDirectDownload(*isoMeta) {
-			node := d.proxmoxInfo.Nodes[0].Name
+			// Download on the node we're connected to (where qm create will run),
+			// falling back to the first discovered node if we can't resolve it.
+			node := d.defaultNodeName()
+			if node == "" && len(d.proxmoxInfo.Nodes) > 0 {
+				node = d.proxmoxInfo.Nodes[0].Name
+			}
 			directOK := false
 
 			// Try 3a: Proxmox native download-url API (pvesh)
@@ -342,12 +431,20 @@ func (d *Deployer) prepareImages() error {
 			if directOK {
 				found, verifyErr := d.storage.ISOExists(uploadStorName, isoFile)
 				if verifyErr == nil && found {
-					d.log(fmt.Sprintf("Direct download successful: %s", isoFile))
-					d.isoResolvedMap[isoFile] = resolvedISO{Storage: uploadStorName, Filename: isoFile}
-					i++
-					continue
+					// Direct downloads disable TLS verification, so confirm content
+					// integrity by MD5 before trusting it. On mismatch the bad file is
+					// deleted and we fall through to the SCP path.
+					if mdErr := d.verifyRemoteISO(uploadStorName, isoFile, isoMeta.MD5); mdErr != nil {
+						d.log(fmt.Sprintf("Direct download failed verification (%v), falling back to SCP", mdErr))
+					} else {
+						d.log(fmt.Sprintf("Direct download successful: %s", isoFile))
+						d.isoResolvedMap[isoFile] = resolvedISO{Storage: uploadStorName, Filename: isoFile}
+						i++
+						continue
+					}
+				} else {
+					d.log("Direct download reported success but ISO not found on storage, falling back to SCP")
 				}
-				d.log("Direct download reported success but ISO not found on storage, falling back to SCP")
 			}
 		}
 
@@ -370,11 +467,37 @@ func (d *Deployer) prepareImages() error {
 			return fmt.Errorf("uploading ISO %s: %w", isoFile, err)
 		}
 		d.log(fmt.Sprintf("Upload complete: %s", isoFile))
+
+		// Confirm the SCP'd bytes match the known MD5 before using the ISO.
+		if err := d.verifyRemoteISO(uploadStorName, isoFile, isoMeta.MD5); err != nil {
+			return fmt.Errorf("verifying uploaded ISO %s: %w", isoFile, err)
+		}
 		d.isoResolvedMap[isoFile] = resolvedISO{Storage: uploadStorName, Filename: isoFile}
 
 		i++
 	}
 
+	return nil
+}
+
+// verifyRemoteISO checks that an ISO on Proxmox storage matches its known MD5.
+// When the MD5 is unknown it skips (no checksum to compare against). On a real
+// mismatch it deletes the bad file so the caller can re-transfer cleanly.
+func (d *Deployer) verifyRemoteISO(storage, filename, expectedMD5 string) error {
+	if expectedMD5 == "" {
+		d.log(fmt.Sprintf("No MD5 known for %s; skipping remote verification", filename))
+		return nil
+	}
+	d.log(fmt.Sprintf("Verifying remote MD5: %s", filename))
+	ok, err := d.storage.VerifyISOMD5(storage, filename, expectedMD5)
+	if err != nil {
+		return fmt.Errorf("verifying remote MD5: %w", err)
+	}
+	if !ok {
+		_ = d.storage.DeleteISO(storage, filename)
+		return fmt.Errorf("remote MD5 mismatch for %s on %s", filename, storage)
+	}
+	d.log(fmt.Sprintf("Remote MD5 verified: %s", filename))
 	return nil
 }
 
@@ -474,11 +597,13 @@ func (d *Deployer) createVMs() ([]VMResult, error) {
 				vmConfig.ISOFile = isoFilename
 			}
 
-			// Set target node
+			// Set target node. Validate has already rejected any component that
+			// targets a node other than the connected one, so an explicit Node here
+			// is guaranteed to match the host we create on.
 			if comp.Node != "" {
 				vmConfig.Node = comp.Node
-			} else if len(d.proxmoxInfo.Nodes) > 0 {
-				vmConfig.Node = d.proxmoxInfo.Nodes[0].Name
+			} else {
+				vmConfig.Node = d.defaultNodeName()
 			}
 
 			d.log(fmt.Sprintf("Creating VM: %s (VMID %d) on %s", vmConfig.Name, vmid, vmConfig.Node))

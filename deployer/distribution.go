@@ -237,44 +237,6 @@ func GetRecommendedStrategy(nodes []proxmox.NodeInfo, haMode bool) DistributionS
 	return StrategyAutoBalance
 }
 
-// ValidateDistribution checks if the distribution is valid
-func ValidateDistribution(components []config.ComponentConfig, nodes []proxmox.NodeInfo) error {
-	// Build map of node resources
-	nodeResources := make(map[string]*NodeScore)
-	for _, node := range nodes {
-		nodeResources[node.Name] = &NodeScore{
-			Node:           node,
-			AvailableCPU:   node.CPUCores - node.CPUUsed,
-			AvailableRAMGB: node.RAMGB - node.RAMUsedGB,
-		}
-	}
-
-	// Check each component fits on its assigned node
-	for _, comp := range components {
-		node, ok := nodeResources[comp.Node]
-		if !ok {
-			continue // Will be caught in deployment validation
-		}
-
-		cpuNeeded := comp.CPU * comp.Count
-		ramNeeded := comp.RAMGB * comp.Count
-
-		if cpuNeeded > node.AvailableCPU {
-			// Warning, not error - might still work with overcommit
-		}
-
-		if ramNeeded > node.AvailableRAMGB {
-			// This is more serious but still might work
-		}
-
-		// Update tracking
-		node.AvailableCPU -= cpuNeeded
-		node.AvailableRAMGB -= ramNeeded
-	}
-
-	return nil
-}
-
 // GetNodeUtilization returns utilization percentage for each node after deployment
 func GetNodeUtilization(components []config.ComponentConfig, nodes []proxmox.NodeInfo) map[string]float64 {
 	utilization := make(map[string]float64)
