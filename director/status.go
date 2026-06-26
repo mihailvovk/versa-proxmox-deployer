@@ -9,8 +9,6 @@ type HeadEndStatus struct {
 	Director    *ComponentStatus
 	Analytics   *ComponentStatus
 	Controllers []*ComponentStatus
-	Routers     []*ComponentStatus
-	Concerto    *ComponentStatus
 
 	// Summary
 	TotalComponents  int

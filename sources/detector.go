@@ -3,11 +3,15 @@ package sources
 import (
 	"fmt"
 	"os"
+	"regexp"
 	"strings"
 
 	"github.com/mihailvovk/versa-proxmox-deployer/config"
 	"github.com/mihailvovk/versa-proxmox-deployer/ssh"
 )
+
+// winLocalPathRe matches Windows drive-letter paths like C:\images or C:/images.
+var winLocalPathRe = regexp.MustCompile(`^[A-Za-z]:[\\/]`)
 
 // SourceType represents the type of image source
 type SourceType string
@@ -34,6 +38,9 @@ func DetectSourceType(url string) SourceType {
 	case strings.HasPrefix(lower, "http://") || strings.HasPrefix(lower, "https://"):
 		return SourceTypeHTTP
 	case strings.HasPrefix(url, "/") || strings.HasPrefix(url, "~"):
+		return SourceTypeLocal
+	case winLocalPathRe.MatchString(url) || strings.HasPrefix(url, `\\`):
+		// Windows drive-letter (C:\...) or UNC (\\server\share) path
 		return SourceTypeLocal
 	default:
 		// Check if it's a local path that exists

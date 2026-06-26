@@ -175,26 +175,9 @@ func (s *S3Source) listObjects() ([]s3Object, error) {
 	client := &http.Client{Timeout: 30 * time.Second}
 
 	for {
-		listURL := fmt.Sprintf("https://%s.s3.%s.amazonaws.com/?list-type=2&prefix=%s",
-			s.bucket, s.region, url.QueryEscape(s.prefix+"/"))
-		if continuationToken != "" {
-			listURL += "&continuation-token=" + url.QueryEscape(continuationToken)
-		}
-
-		resp, err := client.Get(listURL)
+		result, err := s.fetchObjectPage(client, continuationToken)
 		if err != nil {
-			return nil, fmt.Errorf("listing S3 objects: %w", err)
-		}
-		defer resp.Body.Close()
-
-		if resp.StatusCode != http.StatusOK {
-			body, _ := io.ReadAll(resp.Body)
-			return nil, fmt.Errorf("S3 list failed (status %d): %s", resp.StatusCode, string(body))
-		}
-
-		var result s3ListResult
-		if err := xml.NewDecoder(resp.Body).Decode(&result); err != nil {
-			return nil, fmt.Errorf("parsing S3 response: %w", err)
+			return nil, err
 		}
 
 		all = append(all, result.Contents...)
@@ -206,6 +189,40 @@ func (s *S3Source) listObjects() ([]s3Object, error) {
 	}
 
 	return all, nil
+}
+
+// buildListURL builds a ListObjectsV2 URL. An empty prefix must NOT be sent as
+// "/" (S3 keys never start with "/"), so only append &prefix= when one is set.
+func (s *S3Source) buildListURL(continuationToken string) string {
+	listURL := fmt.Sprintf("https://%s.s3.%s.amazonaws.com/?list-type=2", s.bucket, s.region)
+	if s.prefix != "" {
+		listURL += "&prefix=" + url.QueryEscape(s.prefix+"/")
+	}
+	if continuationToken != "" {
+		listURL += "&continuation-token=" + url.QueryEscape(continuationToken)
+	}
+	return listURL
+}
+
+// fetchObjectPage fetches and decodes a single page; the body is closed per call
+// (a deferred close inside the pagination loop would leak connections).
+func (s *S3Source) fetchObjectPage(client *http.Client, continuationToken string) (*s3ListResult, error) {
+	resp, err := client.Get(s.buildListURL(continuationToken))
+	if err != nil {
+		return nil, fmt.Errorf("listing S3 objects: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("S3 list failed (status %d): %s", resp.StatusCode, string(body))
+	}
+
+	var result s3ListResult
+	if err := xml.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("parsing S3 response: %w", err)
+	}
+	return &result, nil
 }
 
 // Download downloads an ISO from S3

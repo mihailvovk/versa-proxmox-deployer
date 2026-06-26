@@ -2,7 +2,6 @@ package sources
 
 import (
 	"fmt"
-	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
@@ -44,12 +43,12 @@ type ISOFile struct {
 
 // ISOCollection holds categorized ISOs from all sources
 type ISOCollection struct {
-	// ISOs grouped by component type
-	Director   []ISOFile
-	Analytics  []ISOFile
-	Controller []ISOFile
-	Concerto   []ISOFile
-	FlexVNF    []ISOFile
+	// ISOs grouped by component type. Controller and Router ISOs are categorized
+	// under FlexVNF (the shared image), so there is no separate Controller slice.
+	Director  []ISOFile
+	Analytics []ISOFile
+	Concerto  []ISOFile
+	FlexVNF   []ISOFile
 
 	// All sources scanned
 	Sources []SourceSummary
@@ -135,9 +134,9 @@ func ScanAllSources(sources []ImageSource) (*ISOCollection, error) {
 
 		isos, err := source.List()
 		if err != nil {
+			// Record the error but still ingest any partial results returned
+			// alongside it (e.g. an SFTP source where one subdirectory failed).
 			summary.Error = err.Error()
-			collection.Sources = append(collection.Sources, summary)
-			continue
 		}
 
 		// Count ISOs and MD5s
@@ -173,7 +172,6 @@ func ScanAllSources(sources []ImageSource) (*ISOCollection, error) {
 
 	sortByVersion(collection.Director)
 	sortByVersion(collection.Analytics)
-	sortByVersion(collection.Controller)
 	sortByVersion(collection.Concerto)
 	sortByVersion(collection.FlexVNF)
 
@@ -336,7 +334,8 @@ func FormatFileSize(bytes int64) string {
 	}
 }
 
-// CacheDir returns the local cache directory for downloaded ISOs
+// CacheDir returns the local cache directory for downloaded ISOs. It delegates
+// to config.CacheDir so both stay in sync with the config directory location.
 func CacheDir() string {
-	return filepath.Join(config.ConfigDir(), "images")
+	return config.CacheDir()
 }

@@ -127,6 +127,12 @@ func (d *Deployer) Validate() error {
 
 	d.log("Validating deployment configuration...")
 
+	// Refuse to "succeed" with nothing to do — this is what made a
+	// deploy of an unchecked component silently report completion.
+	if d.config.VMCount() == 0 {
+		return fmt.Errorf("no components selected to deploy — enable at least one component (check its box in the components table) before deploying")
+	}
+
 	// Check total resources required
 	totalCPU, totalRAM, totalDisk := d.config.GetTotalResources()
 
@@ -147,33 +153,49 @@ func (d *Deployer) Validate() error {
 		return fmt.Errorf("insufficient storage: need %dGB but only %dGB available", totalDisk, targetStorage.AvailableGB)
 	}
 
-	// Check each target node has enough resources
+	// Aggregate per-node demand across ALL components (a node hosting several
+	// components must fit their sum, not each one independently). Count==0 means 1.
+	type nodeDemand struct{ cpu, ram int }
+	demand := make(map[string]nodeDemand)
 	for _, comp := range d.config.Components {
 		node := comp.Node
 		if node == "" && len(d.proxmoxInfo.Nodes) > 0 {
 			node = d.proxmoxInfo.Nodes[0].Name
 		}
+		n := comp.EffectiveCount()
+		cur := demand[node]
+		cur.cpu += comp.CPU * n
+		cur.ram += comp.RAMGB * n
+		demand[node] = cur
+	}
 
+	for node, need := range demand {
+		// Index-based lookup avoids taking the address of a range variable.
 		var targetNode *proxmox.NodeInfo
-		for _, n := range d.proxmoxInfo.Nodes {
-			if n.Name == node {
-				targetNode = &n
+		for i := range d.proxmoxInfo.Nodes {
+			if d.proxmoxInfo.Nodes[i].Name == node {
+				targetNode = &d.proxmoxInfo.Nodes[i]
 				break
 			}
 		}
-
 		if targetNode == nil {
 			return fmt.Errorf("node '%s' not found", node)
 		}
-
 		if targetNode.Status != "online" {
 			return fmt.Errorf("node '%s' is not online", node)
 		}
 
+		// RAM is a hard limit (overcommit risks OOM and failed starts).
 		availableRAM := targetNode.RAMGB - targetNode.RAMUsedGB
-		if comp.RAMGB*comp.Count > availableRAM {
+		if need.ram > availableRAM {
 			return fmt.Errorf("insufficient RAM on node '%s': need %dGB but only %dGB available",
-				node, comp.RAMGB*comp.Count, availableRAM)
+				node, need.ram, availableRAM)
+		}
+		// CPU overcommit is legitimate on Proxmox, so warn instead of failing.
+		availableCPU := targetNode.CPUCores - targetNode.CPUUsed
+		if need.cpu > availableCPU {
+			d.log(fmt.Sprintf("WARNING: node '%s' may be CPU-overcommitted: need %d vCPU but only %d available",
+				node, need.cpu, availableCPU))
 		}
 	}
 
@@ -342,12 +364,20 @@ func (d *Deployer) prepareImages() error {
 			if directOK {
 				found, verifyErr := d.storage.ISOExists(uploadStorName, isoFile)
 				if verifyErr == nil && found {
-					d.log(fmt.Sprintf("Direct download successful: %s", isoFile))
-					d.isoResolvedMap[isoFile] = resolvedISO{Storage: uploadStorName, Filename: isoFile}
-					i++
-					continue
+					// Direct downloads disable TLS verification, so confirm content
+					// integrity by MD5 before trusting it. On mismatch the bad file is
+					// deleted and we fall through to the SCP path.
+					if mdErr := d.verifyRemoteISO(uploadStorName, isoFile, isoMeta.MD5); mdErr != nil {
+						d.log(fmt.Sprintf("Direct download failed verification (%v), falling back to SCP", mdErr))
+					} else {
+						d.log(fmt.Sprintf("Direct download successful: %s", isoFile))
+						d.isoResolvedMap[isoFile] = resolvedISO{Storage: uploadStorName, Filename: isoFile}
+						i++
+						continue
+					}
+				} else {
+					d.log("Direct download reported success but ISO not found on storage, falling back to SCP")
 				}
-				d.log("Direct download reported success but ISO not found on storage, falling back to SCP")
 			}
 		}
 
@@ -370,11 +400,37 @@ func (d *Deployer) prepareImages() error {
 			return fmt.Errorf("uploading ISO %s: %w", isoFile, err)
 		}
 		d.log(fmt.Sprintf("Upload complete: %s", isoFile))
+
+		// Confirm the SCP'd bytes match the known MD5 before using the ISO.
+		if err := d.verifyRemoteISO(uploadStorName, isoFile, isoMeta.MD5); err != nil {
+			return fmt.Errorf("verifying uploaded ISO %s: %w", isoFile, err)
+		}
 		d.isoResolvedMap[isoFile] = resolvedISO{Storage: uploadStorName, Filename: isoFile}
 
 		i++
 	}
 
+	return nil
+}
+
+// verifyRemoteISO checks that an ISO on Proxmox storage matches its known MD5.
+// When the MD5 is unknown it skips (no checksum to compare against). On a real
+// mismatch it deletes the bad file so the caller can re-transfer cleanly.
+func (d *Deployer) verifyRemoteISO(storage, filename, expectedMD5 string) error {
+	if expectedMD5 == "" {
+		d.log(fmt.Sprintf("No MD5 known for %s; skipping remote verification", filename))
+		return nil
+	}
+	d.log(fmt.Sprintf("Verifying remote MD5: %s", filename))
+	ok, err := d.storage.VerifyISOMD5(storage, filename, expectedMD5)
+	if err != nil {
+		return fmt.Errorf("verifying remote MD5: %w", err)
+	}
+	if !ok {
+		_ = d.storage.DeleteISO(storage, filename)
+		return fmt.Errorf("remote MD5 mismatch for %s on %s", filename, storage)
+	}
+	d.log(fmt.Sprintf("Remote MD5 verified: %s", filename))
 	return nil
 }
 

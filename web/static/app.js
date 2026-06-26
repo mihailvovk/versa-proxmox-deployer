@@ -229,10 +229,16 @@ function showStep(id) {
 }
 
 function esc(str) {
-    if (!str) return '';
-    const div = document.createElement('div');
-    div.textContent = str;
-    return div.innerHTML;
+    if (str == null) return '';
+    // Escape for both element-text and double/single-quoted attribute contexts.
+    // textContent->innerHTML only covers &<>, leaving quotes able to break out of
+    // attributes, so handle all five entities explicitly.
+    return String(str)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
 }
 
 function sleep(ms) {

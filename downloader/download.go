@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/mihailvovk/versa-proxmox-deployer/config"
 	"github.com/mihailvovk/versa-proxmox-deployer/sources"
@@ -59,7 +60,7 @@ func (d *Downloader) EnsureISO(iso sources.ISOFile, progress func(downloaded, to
 					result.LocalPath = target // Use actual path for upload
 					if iso.MD5 != "" {
 						result.MD5 = iso.MD5
-						result.MD5Verified = true // Trust the MD5 from scan
+						result.MD5Verified = false // cached; integrity gated by the remote MD5 check on Proxmox
 					}
 					return result, nil
 				}
@@ -75,7 +76,7 @@ func (d *Downloader) EnsureISO(iso sources.ISOFile, progress func(downloaded, to
 				result.WasCached = true
 				if iso.MD5 != "" {
 					result.MD5 = iso.MD5
-					result.MD5Verified = true // Trust the MD5 from scan
+					result.MD5Verified = false // cached; not re-hashed here (remote MD5 check gates integrity)
 				}
 				return result, nil
 			}
@@ -115,10 +116,25 @@ func (d *Downloader) EnsureISO(iso sources.ISOFile, progress func(downloaded, to
 	}
 	result.Size = info.Size()
 
-	// Trust MD5 from source scan rather than re-computing
+	// Verify the bytes we just downloaded against the known MD5. Skip for local
+	// sources (which symlink/copy a trusted on-disk file); the remote MD5 check
+	// after upload is the backstop for cached files.
 	if iso.MD5 != "" {
 		result.MD5 = iso.MD5
-		result.MD5Verified = true
+		if iso.SourceType == string(sources.SourceTypeLocal) {
+			result.MD5Verified = false
+		} else {
+			ok, actual, verr := VerifyMD5(result.LocalPath, iso.MD5)
+			if verr != nil {
+				os.Remove(cachePath)
+				return nil, fmt.Errorf("verifying MD5 of downloaded ISO %s: %w", iso.Filename, verr)
+			}
+			if !ok {
+				os.Remove(cachePath)
+				return nil, fmt.Errorf("MD5 mismatch for %s: expected %s, got %s", iso.Filename, iso.MD5, actual)
+			}
+			result.MD5Verified = true
+		}
 	}
 
 	return result, nil
@@ -264,7 +280,7 @@ func VerifyMD5(path, expectedMD5 string) (bool, string, error) {
 		return false, "", err
 	}
 
-	return actualMD5 == expectedMD5, actualMD5, nil
+	return strings.EqualFold(actualMD5, expectedMD5), actualMD5, nil
 }
 
 // ReadMD5File reads an MD5 checksum from a .md5 file
@@ -281,7 +297,7 @@ func ReadMD5File(path string) (string, error) {
 		return "", fmt.Errorf("invalid MD5 file format")
 	}
 
-	return fields[0], nil
+	return strings.ToLower(fields[0]), nil
 }
 
 // splitFields splits a string on whitespace

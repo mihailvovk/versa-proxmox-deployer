@@ -25,7 +25,9 @@ function rebuildComponents() {
         }
         return {
             type,
-            enabled: type !== 'concerto',
+            // Concerto is an optional add-on, so it's opt-in in standard/HA mode.
+            // But when the user explicitly picks it in single-component mode, enable it.
+            enabled: state.mode === 'single' ? true : (type !== 'concerto'),
             count,
             cpu: DEFAULT_SPECS[type].cpu,
             ram: DEFAULT_SPECS[type].ram,

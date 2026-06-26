@@ -21,6 +21,11 @@ type ProxmoxInfo struct {
 	Storage     []StorageInfo
 	Networks    []NetworkInfo
 	ExistingVMs []VMInfo
+
+	// SectionErrors holds per-section errors from DiscoverParallel (e.g. "nodes",
+	// "storage"). Empty when every section succeeded. Lets callers surface a
+	// partial-discovery warning instead of silently showing empty data.
+	SectionErrors map[string]string
 }
 
 // NodeInfo holds information about a Proxmox node
@@ -133,7 +138,7 @@ func (d *Discoverer) Discover() (*ProxmoxInfo, error) {
 // networks, and VMs in parallel. Partial results are returned even if some
 // sub-discoveries fail; per-section errors are embedded in the result.
 func (d *Discoverer) DiscoverParallel() (*ProxmoxInfo, error) {
-	info := &ProxmoxInfo{}
+	info := &ProxmoxInfo{SectionErrors: make(map[string]string)}
 
 	// Phase 1: Version (fast, required)
 	version, err := d.GetVersion()
@@ -156,41 +161,49 @@ func (d *Discoverer) DiscoverParallel() (*ProxmoxInfo, error) {
 	go func() {
 		defer wg.Done()
 		nodes, err := d.GetNodes()
-		if err == nil {
-			mu.Lock()
-			info.Nodes = nodes
-			mu.Unlock()
+		mu.Lock()
+		defer mu.Unlock()
+		if err != nil {
+			info.SectionErrors["nodes"] = err.Error()
+			return
 		}
+		info.Nodes = nodes
 	}()
 
 	go func() {
 		defer wg.Done()
 		storage, err := d.GetStorage()
-		if err == nil {
-			mu.Lock()
-			info.Storage = storage
-			mu.Unlock()
+		mu.Lock()
+		defer mu.Unlock()
+		if err != nil {
+			info.SectionErrors["storage"] = err.Error()
+			return
 		}
+		info.Storage = storage
 	}()
 
 	go func() {
 		defer wg.Done()
 		networks, err := d.GetNetworks()
-		if err == nil {
-			mu.Lock()
-			info.Networks = networks
-			mu.Unlock()
+		mu.Lock()
+		defer mu.Unlock()
+		if err != nil {
+			info.SectionErrors["networks"] = err.Error()
+			return
 		}
+		info.Networks = networks
 	}()
 
 	go func() {
 		defer wg.Done()
 		vms, err := d.GetVMs()
-		if err == nil {
-			mu.Lock()
-			info.ExistingVMs = vms
-			mu.Unlock()
+		mu.Lock()
+		defer mu.Unlock()
+		if err != nil {
+			info.SectionErrors["vms"] = err.Error()
+			return
 		}
+		info.ExistingVMs = vms
 	}()
 
 	wg.Wait()
@@ -313,8 +326,25 @@ func (d *Discoverer) GetNodes() ([]NodeInfo, error) {
 	}}, nil
 }
 
-// countRunningVMs counts running VMs on a node
+// countRunningVMs counts running VMs on a specific node. It queries the cluster
+// API scoped to nodeName so per-node counts are correct on a cluster; on failure
+// (e.g. a standalone host) it falls back to the node-local `qm list`.
 func (d *Discoverer) countRunningVMs(nodeName string) int {
+	var vms []struct {
+		Status string `json:"status"`
+	}
+	cmd := fmt.Sprintf("pvesh get /nodes/%s/qemu --output-format json", ssh.ShellEscape(nodeName))
+	if err := d.client.RunJSON(cmd, &vms); err == nil {
+		count := 0
+		for _, vm := range vms {
+			if vm.Status == "running" {
+				count++
+			}
+		}
+		return count
+	}
+
+	// Fallback: node-local qm list (standalone hosts).
 	result, err := d.client.Run("qm list 2>/dev/null | grep -c running || echo 0")
 	if err != nil {
 		return 0
