@@ -325,6 +325,15 @@ func (d *Deployer) prepareImages() error {
 			return fmt.Errorf("ISO metadata not found for %s — ensure image sources are configured", isoFile)
 		}
 
+		// Resolve the MD5 from the source's .md5 companion if the scan only noted
+		// its presence. Without this, MD5 dedup and the remote integrity check
+		// below silently skip for http/dropbox/s3 sources.
+		if isoMeta.MD5 == "" {
+			if md5 := d.downloader.ResolveMD5(*isoMeta); md5 != "" {
+				isoMeta.MD5 = md5
+			}
+		}
+
 		// 2. Check if same content exists under a different filename (MD5 match)
 		if isoMeta.MD5 != "" {
 			d.log(fmt.Sprintf("Checking for existing ISO by MD5 (%s)...", isoMeta.MD5[:8]))

@@ -36,6 +36,36 @@ type DownloadResult struct {
 	Size       int64
 }
 
+// md5Downloader is implemented by sources that can fetch an ISO's .md5 companion
+// (http, dropbox, s3). It's not part of the ImageSource interface.
+type md5Downloader interface {
+	DownloadMD5(iso sources.ISOFile) (string, error)
+}
+
+// ResolveMD5 returns the known MD5 for an ISO, fetching it from the source's
+// .md5 companion file when the scan only recorded its presence (HasMD5File) but
+// not the value. Returns "" when no checksum is available. This is what lets the
+// remote integrity check actually run for http/dropbox/s3 direct downloads.
+func (d *Downloader) ResolveMD5(iso sources.ISOFile) string {
+	if iso.MD5 != "" {
+		return strings.ToLower(strings.TrimSpace(iso.MD5))
+	}
+	if !iso.HasMD5File {
+		return ""
+	}
+	for _, src := range d.sources {
+		if src.Name() != iso.SourceName {
+			continue
+		}
+		if m, ok := src.(md5Downloader); ok {
+			if md5, err := m.DownloadMD5(iso); err == nil {
+				return strings.ToLower(strings.TrimSpace(md5))
+			}
+		}
+	}
+	return ""
+}
+
 // EnsureISO ensures an ISO is available locally (downloads if needed)
 func (d *Downloader) EnsureISO(iso sources.ISOFile, progress func(downloaded, total int64)) (*DownloadResult, error) {
 	result := &DownloadResult{}
