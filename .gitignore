@@ -16,8 +16,10 @@ logs/
 server.crt
 server.key
 
-# Documentation (managed outside repo)
+# Documentation: internal notes stay out of the repo, but ship the public docs.
 *.md
+!README.md
+!CHANGELOG.md
 
 # OS
 .DS_Store
