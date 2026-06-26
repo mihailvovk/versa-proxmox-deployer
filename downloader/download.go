@@ -48,7 +48,12 @@ type md5Downloader interface {
 // remote integrity check actually run for http/dropbox/s3 direct downloads.
 func (d *Downloader) ResolveMD5(iso sources.ISOFile) string {
 	if iso.MD5 != "" {
-		return strings.ToLower(strings.TrimSpace(iso.MD5))
+		// A pre-recorded value can still be garbage (hand-edited/HTML-error .md5
+		// companion); validate before any caller slices or trusts it.
+		if m := normalizeMD5(iso.MD5); m != "" {
+			return m
+		}
+		return ""
 	}
 	if !iso.HasMD5File {
 		return ""
@@ -59,11 +64,30 @@ func (d *Downloader) ResolveMD5(iso sources.ISOFile) string {
 		}
 		if m, ok := src.(md5Downloader); ok {
 			if md5, err := m.DownloadMD5(iso); err == nil {
-				return strings.ToLower(strings.TrimSpace(md5))
+				if v := normalizeMD5(md5); v != "" {
+					return v
+				}
 			}
 		}
 	}
 	return ""
+}
+
+// normalizeMD5 lowercases/trims a checksum and returns it only if it is exactly
+// 32 hex digits. A truncated or HTML-error companion file (anything else) yields
+// "" so callers never slice or compare against a malformed value. This is the
+// guard that prevents the `md5[:8]` panic in the deploy goroutine.
+func normalizeMD5(s string) string {
+	s = strings.ToLower(strings.TrimSpace(s))
+	if len(s) != 32 {
+		return ""
+	}
+	for _, c := range s {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return ""
+		}
+	}
+	return s
 }
 
 // EnsureISO ensures an ISO is available locally (downloads if needed)

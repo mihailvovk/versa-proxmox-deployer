@@ -108,17 +108,27 @@ func NewClient(opts ClientOptions) (*Client, error) {
 // Connect establishes the SSH connection and starts keepalive
 func (c *Client) Connect() error {
 	c.mu.Lock()
-	defer c.mu.Unlock()
-
 	if c.client != nil {
+		c.mu.Unlock()
 		return nil // Already connected
 	}
+	c.mu.Unlock()
 
+	// Dial outside the lock — dialSSH does up to ~30s of network I/O, and holding
+	// c.mu across it would stall IsConnected/Close/keepalive/status polls.
 	client, err := c.dialSSH()
 	if err != nil {
 		return err
 	}
 
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.client != nil {
+		// Another goroutine connected while we were dialing — keep theirs and
+		// close our redundant connection so it doesn't leak.
+		client.Close()
+		return nil
+	}
 	c.client = client
 	c.startKeepalive()
 	return nil

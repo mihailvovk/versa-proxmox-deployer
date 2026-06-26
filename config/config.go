@@ -93,7 +93,24 @@ func migrateLegacyConfig(dir string) {
 	if err != nil {
 		return // no legacy config to migrate
 	}
-	if err := os.WriteFile(newPath, data, 0600); err == nil {
+	// Write atomically (temp + rename) — a plain WriteFile interrupted mid-write
+	// would leave a truncated canonical config that the os.Stat guard then never
+	// re-migrates, so Load would fail to parse forever.
+	tmp, err := os.CreateTemp(dir, "config-*.json.tmp")
+	if err != nil {
+		return
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName) // no-op after a successful rename
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return
+	}
+	tmp.Chmod(0600) // best-effort
+	if err := tmp.Close(); err != nil {
+		return
+	}
+	if err := os.Rename(tmpName, newPath); err == nil {
 		slog.Info("migrated config to new location", "from", oldPath, "to", newPath)
 	}
 }

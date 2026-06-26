@@ -24,11 +24,34 @@ type ConsoleSession struct {
 	CreatedAt  time.Time `json:"createdAt"`
 	LastActive time.Time `json:"-"`
 
-	mu        sync.Mutex
+	mu        sync.Mutex // guards LastActive and session state
+	writeMu   sync.Mutex // serializes writes to wsConn (gorilla allows one writer)
 	closeOnce sync.Once
 	wsConn    *websocket.Conn
 	pty       *ssh.PTYSession
 	done      chan struct{}
+}
+
+// consoleWriteTimeout bounds every WebSocket write so a stalled/half-open client
+// can never block a writer indefinitely (which previously wedged the reaper).
+const consoleWriteTimeout = 10 * time.Second
+
+// writeJSON writes a console message under writeMu with a write deadline. It does
+// NOT touch sess.mu, so the reaper and close path are never blocked by a slow
+// client.
+func (sess *ConsoleSession) writeJSON(msg consoleMessage) error {
+	sess.writeMu.Lock()
+	defer sess.writeMu.Unlock()
+	sess.wsConn.SetWriteDeadline(time.Now().Add(consoleWriteTimeout))
+	return sess.wsConn.WriteJSON(msg)
+}
+
+// writeClose sends a close frame under writeMu with a write deadline.
+func (sess *ConsoleSession) writeClose(code int, text string) {
+	sess.writeMu.Lock()
+	defer sess.writeMu.Unlock()
+	sess.wsConn.SetWriteDeadline(time.Now().Add(consoleWriteTimeout))
+	sess.wsConn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(code, text))
 }
 
 var (
@@ -100,6 +123,10 @@ func (s *Server) handleConsoleSerial(w http.ResponseWriter, r *http.Request) {
 		slog.Error("console serial: websocket upgrade failed", "error", err, "vmid", vmid)
 		return
 	}
+	// Bound all handshake-phase writes (before the ConsoleSession exists) so a
+	// half-open client can't block this handler goroutine indefinitely. The pump
+	// resets the deadline per write via writeJSON once the session is live.
+	wsConn.SetWriteDeadline(time.Now().Add(consoleWriteTimeout))
 
 	// If no serial device, send an error and close — don't fall back to qm monitor
 	if !hasSerial {
@@ -177,9 +204,9 @@ func (s *Server) handleConsoleSerial(w http.ResponseWriter, r *http.Request) {
 			if n > 0 {
 				sess.mu.Lock()
 				sess.LastActive = time.Now()
-				writeErr := wsConn.WriteJSON(consoleMessage{Type: "data", Data: string(buf[:n])})
 				sess.mu.Unlock()
-				if writeErr != nil {
+				// Bounded write outside sess.mu so a stalled client can't wedge the reaper.
+				if writeErr := sess.writeJSON(consoleMessage{Type: "data", Data: string(buf[:n])}); writeErr != nil {
 					break
 				}
 			}
@@ -358,16 +385,13 @@ func closeConsoleSession(sess *ConsoleSession) {
 		duration := time.Since(sess.CreatedAt).Round(time.Second)
 		slog.Info("console: session closed", "session", sess.ID, "vmid", sess.VMID, "type", sess.Type, "duration", duration)
 
-		// Close WebSocket with close frame
-		sess.mu.Lock()
+		// Close WebSocket with a bounded close frame, then close the conn. The
+		// write is guarded by writeMu (not sess.mu) with a deadline so a dead
+		// client can't block teardown.
 		if sess.wsConn != nil {
-			sess.wsConn.WriteMessage(
-				websocket.CloseMessage,
-				websocket.FormatCloseMessage(websocket.CloseNormalClosure, "session ended"),
-			)
+			sess.writeClose(websocket.CloseNormalClosure, "session ended")
 			sess.wsConn.Close()
 		}
-		sess.mu.Unlock()
 
 		// Close PTY
 		if sess.pty != nil {

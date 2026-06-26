@@ -106,16 +106,18 @@ func CreateSource(src config.ImageSource) (ImageSource, error) {
 	}
 }
 
-// CreateSourcesFromConfig creates ImageSources from config
-func CreateSourcesFromConfig(cfg *config.Config) ([]ImageSource, error) {
+// CreateSourcesFromConfig creates ImageSources from a list of configured image
+// sources. Callers pass a snapshot of the slice (not the live config field) so
+// concurrent config mutation can't tear the slice header mid-iteration.
+func CreateSourcesFromConfig(srcs []config.ImageSource) ([]ImageSource, error) {
 	var sources []ImageSource
 
 	// If no sources configured, return empty list — user must add sources
-	if len(cfg.ImageSources) == 0 {
+	if len(srcs) == 0 {
 		return sources, nil
 	}
 
-	for _, src := range cfg.ImageSources {
+	for _, src := range srcs {
 		source, err := CreateSource(src)
 		if err != nil {
 			// Log error but continue with other sources

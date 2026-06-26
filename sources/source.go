@@ -64,6 +64,10 @@ type SourceSummary struct {
 	Error     string
 }
 
+// vanTokenRe matches "van" only as a delimited token (e.g. "...-van-...", not
+// "advanced"/"caravan"), so arbitrary ISO names aren't misclassified as Analytics.
+var vanTokenRe = regexp.MustCompile(`(^|[-_.])van([-_.]|$)`)
+
 // DetectComponent detects the component type from an ISO filename
 func DetectComponent(filename string) config.ComponentType {
 	lower := strings.ToLower(filename)
@@ -71,7 +75,7 @@ func DetectComponent(filename string) config.ComponentType {
 	switch {
 	case strings.Contains(lower, "director"):
 		return config.ComponentDirector
-	case strings.Contains(lower, "analytics") || strings.Contains(lower, "van"):
+	case strings.Contains(lower, "analytics") || vanTokenRe.MatchString(lower):
 		return config.ComponentAnalytics
 	case strings.Contains(lower, "concerto"):
 		return config.ComponentConcerto

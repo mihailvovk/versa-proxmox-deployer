@@ -187,7 +187,13 @@ func runDeploy(cmd *cobra.Command, args []string) {
 	componentStrs, _ := cmd.Flags().GetStringSlice("components")
 	for _, cs := range componentStrs {
 		compType := config.ComponentType(cs)
-		spec := config.DefaultVMSpecs[compType]
+		spec, ok := config.DefaultVMSpecs[compType]
+		if !ok {
+			// Reject an unknown name up front instead of silently building a
+			// zero-spec VM (cores 0 / 0GB) that only fails late during qm create.
+			fmt.Fprintf(os.Stderr, "Error: unknown component %q\n", cs)
+			os.Exit(1)
+		}
 		deployCfg.Components = append(deployCfg.Components, config.ComponentConfig{
 			Type:   compType,
 			Count:  1,
@@ -208,7 +214,7 @@ func runDeploy(cmd *cobra.Command, args []string) {
 		slog.Warn("could not load config", "error", err)
 		cfg = config.Default()
 	}
-	imageSources, _ := sources.CreateSourcesFromConfig(cfg)
+	imageSources, _ := sources.CreateSourcesFromConfig(cfg.ImageSources)
 
 	d := deployer.NewDeployer(client, imageSources)
 	d.SetConfig(deployCfg)
@@ -314,7 +320,7 @@ func runReleases(cmd *cobra.Command, args []string) {
 		slog.Warn("could not load config", "error", err)
 		cfg = config.Default()
 	}
-	imageSources, err := sources.CreateSourcesFromConfig(cfg)
+	imageSources, err := sources.CreateSourcesFromConfig(cfg.ImageSources)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)

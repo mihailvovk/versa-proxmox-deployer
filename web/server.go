@@ -122,6 +122,16 @@ func (s *Server) setConnection(client *ssh.Client, disc *proxmox.Discoverer) {
 	}
 }
 
+// snapshotSources returns a copy of the configured image sources taken under
+// cfgMu. Background scans, deploys, and GET handlers must build sources from
+// this snapshot (never the live s.cfg.ImageSources slice) so a concurrent
+// add/remove can't tear the slice header into a ptr/len mismatch.
+func (s *Server) snapshotSources() []config.ImageSource {
+	s.cfgMu.Lock()
+	defer s.cfgMu.Unlock()
+	return append([]config.ImageSource(nil), s.cfg.ImageSources...)
+}
+
 // getOutboundIP returns the preferred outbound IP of this machine
 func getOutboundIP() string {
 	conn, err := net.DialTimeout("udp", "8.8.8.8:80", 2*time.Second)
@@ -330,6 +340,26 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 		req.User = "root"
 	}
 
+	// Refuse to reconnect while a deploy is running: setConnection closes the old
+	// SSH client, and the in-flight deployer captured that exact pointer — swapping
+	// it out mid-deploy kills every subsequent qm/pvesm/scp and triggers a rollback
+	// over a dead connection.
+	s.deployMu.RLock()
+	deployActive := s.deployStatus != nil && s.deployStatus.Active
+	s.deployMu.RUnlock()
+	if deployActive {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusConflict)
+		json.NewEncoder(w).Encode(APIResponse{Error: "A deployment is in progress; cannot reconnect"})
+		return
+	}
+
+	// Snapshot saved credentials under cfgMu (a concurrent config save mutates them).
+	s.cfgMu.Lock()
+	savedKeyPath := s.cfg.LastSSHKeyPath
+	savedPassword := s.cfg.LastProxmoxPassword
+	s.cfgMu.Unlock()
+
 	// Build SSH client options
 	opts := ssh.ClientOptions{
 		Host:         req.Host,
@@ -339,14 +369,14 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.SSHKeyPath != "" {
 		opts.KeyPath = req.SSHKeyPath
-	} else if s.cfg.LastSSHKeyPath != "" {
-		opts.KeyPath = s.cfg.LastSSHKeyPath
+	} else if savedKeyPath != "" {
+		opts.KeyPath = savedKeyPath
 	}
 	if req.Password != "" {
 		opts.Password = req.Password
-	} else if s.cfg.LastProxmoxPassword != "" {
+	} else if savedPassword != "" {
 		// Use saved password when user leaves the field empty
-		opts.Password = s.cfg.LastProxmoxPassword
+		opts.Password = savedPassword
 	}
 
 	client, err := ssh.NewClient(opts)
@@ -431,7 +461,7 @@ func (s *Server) runParallelDiscovery() {
 
 	// Scan image sources in background (can be slow)
 	go func() {
-		imageSources, err := sources.CreateSourcesFromConfig(s.cfg)
+		imageSources, err := sources.CreateSourcesFromConfig(s.snapshotSources())
 		if err != nil {
 			return
 		}
@@ -668,7 +698,7 @@ func (s *Server) handleDeploy(w http.ResponseWriter, r *http.Request) {
 	deployCfg.Networks = req.Networks
 	deployCfg.Components = req.Components
 
-	imageSources, _ := sources.CreateSourcesFromConfig(s.cfg)
+	imageSources, _ := sources.CreateSourcesFromConfig(s.snapshotSources())
 
 	dep := deployer.NewDeployer(client, imageSources)
 	dep.SetConfig(deployCfg)
@@ -940,7 +970,7 @@ func (s *Server) handleScanSources(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	imageSources, err := sources.CreateSourcesFromConfig(s.cfg)
+	imageSources, err := sources.CreateSourcesFromConfig(s.snapshotSources())
 	if err != nil {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(ScanSourcesResponse{APIResponse: APIResponse{Error: err.Error()}})
@@ -1117,7 +1147,7 @@ func (s *Server) handleSources(w http.ResponseWriter, r *http.Request) {
 
 // scanAndUpdateImages scans all configured sources and updates discovery state
 func (s *Server) scanAndUpdateImages() {
-	imageSources, err := sources.CreateSourcesFromConfig(s.cfg)
+	imageSources, err := sources.CreateSourcesFromConfig(s.snapshotSources())
 	if err != nil {
 		return
 	}
